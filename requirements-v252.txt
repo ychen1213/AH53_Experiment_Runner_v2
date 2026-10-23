@@ -1,0 +1,4 @@
+# Reference only: packages shipped with this machine's Lumerical 2025 R2.
+# No package installation is required for the validated bundled interpreter.
+numpy==2.2.2
+matplotlib==3.10.0

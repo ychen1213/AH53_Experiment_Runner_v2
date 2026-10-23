@@ -1,0 +1,81 @@
+{
+  "schema_version": "2.0",
+  "output_dir": "../output_ah53_physics_validation",
+  "lumerical_api_python": "D:/Ansys Inc/v252/Lumerical/api/python",
+  "max_case_minutes": 10,
+  "capture_field_count_per_group": 0,
+  "closure_warn_above": 0.03,
+  "flux_warn_above": 0.01,
+  "validation_tolerances": {
+    "phase_amplitude_floor": 0.0001,
+    "complex_absolute": 0.01,
+    "phase_deg": 2.0,
+    "power_closure_absolute": 0.03,
+    "flux_decomposition_absolute": 0.01,
+    "reference_leakage_power_max": 0.000001,
+    "flux_decomposition_relative": 0.05,
+    "flux_reflection_floor": 0.001,
+    "air_reflected_power_max": 0.0001,
+    "fresnel_power_absolute": 0.005,
+    "parasitic_orders_power_max": 0.0001,
+    "symmetry_power_absolute": 0.00001,
+    "symmetry_power_relative": 0.02,
+    "translation_amplitude_relative": 0.03
+  },
+  "base_model": {
+    "geometry_kind": "ah53",
+    "period_nm": 16000,
+    "child_pitch_nm": 3200,
+    "ridge_cd_nm": 1600,
+    "ridge_height_nm": 300,
+    "ridge_shift_nm": 0,
+    "ridge_center_offsets_nm": [0, 0, 0],
+    "ridge_top_left_inset_nm": 0,
+    "ridge_top_right_inset_nm": 0,
+    "wavelength_nm": 643,
+    "n_substrate": 1.5,
+    "n_ridge": 2.0,
+    "films": [],
+    "mesh": {"mode": "override", "mesh_accuracy": 2, "dx_nm": 50, "dy_nm": 30},
+    "sim": {
+      "simulation_time_fs": 900,
+      "y_min_um": -1.30,
+      "y_max_um": 2.30,
+      "mesh_y_min_um": -1.30,
+      "mesh_y_max_um": 2.30,
+      "pml_layers": 16,
+      "pml_profile": 1,
+      "source_y_um": 1.35,
+      "incident1_y_um": 1.00,
+      "incident2_y_um": 1.10,
+      "reflection_y_um": 1.63,
+      "transmission_y_um": -1.05,
+      "reference_y_um": 1.80,
+      "field_y_min_um": -0.8,
+      "field_y_max_um": 1.2,
+      "stripe_z_span_um": 1.0
+    }
+  },
+  "experiments": [
+    {
+      "name": "planar_air",
+      "parameter": "n_substrate",
+      "values": [1.0],
+      "overrides": {"geometry_kind": "planar_interface", "films": []},
+      "note": "Air-only physical null benchmark; actual FDTD results required."
+    },
+    {
+      "name": "planar_n15",
+      "parameter": "n_substrate",
+      "values": [1.5],
+      "overrides": {"geometry_kind": "planar_interface", "films": []},
+      "note": "Interface at y=0; both p vectors have +X at normal incidence."
+    },
+    {
+      "name": "bare_mark_translation",
+      "parameter": "ridge_shift_nm",
+      "values": [0, 100],
+      "note": "Bare symmetric AH53 and its rigid +100 nm translation."
+    }
+  ]
+}

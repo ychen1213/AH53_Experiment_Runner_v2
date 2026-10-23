@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+# Calibration fingerprints hash the exact source bytes. Preserve these files
+# across Windows/Linux checkouts instead of changing their line endings.
+ah53runner/solver.py -text
+ah53runner/geometry.py -text
+ah53runner/rcwa.py -text
+tools/validate_rcwa_origin.py -text
+
+*.bat text eol=crlf

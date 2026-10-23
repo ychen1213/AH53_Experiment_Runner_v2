@@ -1,0 +1,95 @@
+{
+  "schema_version": "2.0",
+  "output_dir": "../output_ah53_overnight",
+  "lumerical_api_python": "D:/Ansys Inc/v252/Lumerical/api/python",
+  "max_case_minutes": 15,
+  "capture_field_count_per_group": 3,
+  "closure_warn_above": 0.05,
+  "flux_warn_above": 0.03,
+  "base_model": {
+    "period_nm": 16000,
+    "child_pitch_nm": 3200,
+    "ridge_cd_nm": 1600,
+    "ridge_height_nm": 300,
+    "ridge_shift_nm": 0,
+    "ridge_center_offsets_nm": [0,0,0],
+    "ridge_top_left_inset_nm": 0,
+    "ridge_top_right_inset_nm": 0,
+    "wavelength_nm": 643,
+    "n_substrate": 1.5,
+    "n_ridge": 2.0,
+    "films": [],
+    "mesh": {"mode":"override","mesh_accuracy":2,"dx_nm":50,"dy_nm":30},
+    "sim": {
+      "simulation_time_fs": 900,
+      "y_min_um": -1.30,
+      "y_max_um": 2.30,
+      "mesh_y_min_um": -1.30,
+      "mesh_y_max_um": 2.30,
+      "pml_layers": 16,
+      "pml_profile": 1,
+      "source_y_um": 1.35,
+      "incident1_y_um": 1.00,
+      "incident2_y_um": 1.10,
+      "reflection_y_um": 1.63,
+      "transmission_y_um": -1.05,
+      "reference_y_um": 1.80,
+      "field_y_min_um": -0.8,
+      "field_y_max_um": 1.2,
+      "stripe_z_span_um": 1.0
+    }
+  },
+  "experiments": [
+    {
+      "name":"planarized_cap_nm",
+      "parameter":"films.0.thickness_nm",
+      "values":[0,50,100,150,200,250,300,350,400],
+      "overrides":{"films":[{"mode":"planarized","thickness_nm":0,"n":1.46,"k":0}]},
+      "note":"Planarized fill + top cap; 0 nm still fills trenches"
+    },
+    {
+      "name":"conformal_thickness_nm",
+      "parameter":"films.0.thickness_nm",
+      "values":[0,50,100,150,200],
+      "overrides":{"films":[{"mode":"conformal","thickness_nm":0,"n":1.46,"k":0}]},
+      "note":"Rectilinear square-corner conformal approximation"
+    },
+    {
+      "name":"mesh_dx_nm",
+      "parameter":"mesh.dx_nm",
+      "values":[70,50,35,25],
+      "note":"Local mesh in override mode, dy fixed 30 nm"
+    },
+    {
+      "name":"mesh_accuracy_auto",
+      "parameter":"mesh.mesh_accuracy",
+      "values":[2,3,4],
+      "overrides":{"mesh":{"mode":"auto","mesh_accuracy":2}},
+      "note":"Auto mesh accuracy sweep; override disabled"
+    },
+    {
+      "name":"ridge_height_nm",
+      "parameter":"ridge_height_nm",
+      "values":[100,200,300,400],
+      "note":"Bare Mark, no film. Only ridge height changes"
+    },
+    {
+      "name":"ridge_cd_nm",
+      "parameter":"ridge_cd_nm",
+      "values":[1200,1400,1600,1800,2000],
+      "note":"Bare Mark, ridge centers fixed"
+    },
+    {
+      "name":"ridge_shift_nm",
+      "parameter":"ridge_shift_nm",
+      "values":[-100,-50,0,50,100],
+      "note":"Full rigid shift; expect phase difference delta_phi(+m,-m)=-4pi*m*dx/P"
+    },
+    {
+      "name":"asymmetric_top_inset_nm",
+      "parameter":"ridge_top_left_inset_nm",
+      "values":[0,30,60,90],
+      "note":"2D polygon slope on only the left wall; no coating"
+    }
+  ]
+}

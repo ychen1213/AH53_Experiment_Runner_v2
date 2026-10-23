@@ -1,0 +1,25 @@
+# Generated solver results and machine-specific evidence stay on this computer.
+/output/
+/output_*/
+/logs/
+/local_validation/
+/.playwright-cli/
+/configs/local_runtime.json
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.lic
+*.pem
+*.pfx
+
+# Lumerical project binaries, backups, and transient engine files.
+*.fsp
+*.fsp.*
+*.bak
+*.lock

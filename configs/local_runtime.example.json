@@ -1,0 +1,6 @@
+{
+  "python_executable": "C:/Program Files/ANSYS Inc/v252/Lumerical/python/python.exe",
+  "lumerical_release": "2025 R2",
+  "verified_python_version": "3.13.1",
+  "note": "Example path only. Copy to local_runtime.json and set the actual installed Python path. The validation release was 2025 R2; 2023 R2.1 is unverified."
+}
