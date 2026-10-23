@@ -1,0 +1,72 @@
+{
+  "schema_version": "2.0",
+  "output_dir": "../output_ah53_tutorial",
+  "lumerical_api_python": "D:/Ansys Inc/v252/Lumerical/api/python",
+  "max_case_minutes": 10,
+  "capture_field_count_per_group": 3,
+  "closure_warn_above": 0.05,
+  "flux_warn_above": 0.03,
+  "base_model": {
+    "period_nm": 16000,
+    "child_pitch_nm": 3200,
+    "ridge_cd_nm": 1600,
+    "ridge_height_nm": 300,
+    "ridge_shift_nm": 0,
+    "ridge_center_offsets_nm": [
+      0,
+      0,
+      0
+    ],
+    "ridge_top_left_inset_nm": 0,
+    "ridge_top_right_inset_nm": 0,
+    "wavelength_nm": 643,
+    "n_substrate": 1.5,
+    "n_ridge": 2,
+    "films": [
+      {
+        "mode": "planarized",
+        "thickness_nm": 0,
+        "n": 1.46,
+        "k": 0
+      }
+    ],
+    "mesh": {
+      "mode": "override",
+      "mesh_accuracy": 2,
+      "dx_nm": 50,
+      "dy_nm": 30
+    },
+    "sim": {
+      "simulation_time_fs": 900,
+      "y_min_um": -1.3,
+      "y_max_um": 2.3,
+      "mesh_y_min_um": -1.3,
+      "mesh_y_max_um": 2.3,
+      "pml_layers": 16,
+      "pml_profile": 1,
+      "source_y_um": 1.35,
+      "incident1_y_um": 1,
+      "incident2_y_um": 1.1,
+      "reflection_y_um": 1.63,
+      "transmission_y_um": -1.05,
+      "reference_y_um": 1.8,
+      "field_y_min_um": -0.8,
+      "field_y_max_um": 1.2,
+      "stripe_z_span_um": 1
+    }
+  },
+  "experiments": [
+    {
+      "name": "film_cap_tutorial",
+      "parameter": "films.0.thickness_nm",
+      "values": [
+        0,
+        100,
+        200,
+        300,
+        400
+      ],
+      "note": "Tutorial: planarized groove fill plus top cap; 0 nm still fills trenches. Same coarse settings as quick; no additional accuracy claim."
+    }
+  ]
+}
