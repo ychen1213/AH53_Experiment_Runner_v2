@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 from .artifacts import load_artifacts, strict_json_loads
 from .validation import DEFAULT_TOLERANCES
+from .materials import EFFECTIVE_ABSORPTION_K_THRESHOLD
 
 
 def _status(path):
@@ -125,6 +126,8 @@ def make_report(output:Path,cases:list,cfg:dict):
     figdir=output/'figures'
     figdir.mkdir(parents=True,exist_ok=True)
     rows=[]
+    material_rows=[]
+    power_rows=[]
     report_records={}
     qc=[]
     absolute_floor=float(cfg.get('phase_min_amplitude',1e-8))
@@ -141,6 +144,8 @@ def make_report(output:Path,cases:list,cfg:dict):
                 r=verified['result']
                 case_rows=[]
                 case_qc=[]
+                case_material_rows=[]
+                case_power_rows=[]
                 for i,m in enumerate(r['orders']):
                     row={'case_id':c['id'],'group':c['group'],'parameter':c['parameter'],
                          'value':c['value'],'m':int(m),'theta_deg':float(r['theta_deg'][i]),
@@ -158,10 +163,34 @@ def make_report(output:Path,cases:list,cfg:dict):
                 q=verified['quality']
                 case_qc.extend(_strict_power_warnings(c['id'],q))
                 for pol in ('s','p'):
-                    if abs(q[f'power_closure_{pol}']-1)>float(cfg.get('closure_warn_above',0.05)):
-                        case_qc.append((c['id'],f'Power closure {pol}',q[f'power_closure_{pol}']))
+                    closure=q[f'power_closure_{pol}']
+                    closure_error=(max(0.,closure-1) if q.get('absorption_present',False)
+                                   else abs(closure-1))
+                    if closure_error>float(cfg.get('closure_warn_above',0.05)):
+                        meaning='Passive R+T bound' if q.get('absorption_present',False) else 'Lossless power closure'
+                        case_qc.append((c['id'],f'{meaning} {pol}',closure))
                     if q[f'flux_decomposition_error_{pol}']>float(cfg.get('flux_warn_above',0.03)):
                         case_qc.append((c['id'],f'Fourier/monitor discrepancy {pol}',q[f'flux_decomposition_error_{pol}']))
+                    case_power_rows.append({
+                        'case_id':c['id'],'polarization':pol,
+                        'R':q[f'total_reflected_{pol}'],'T_internal_plane':q[f'total_transmitted_{pol}'],
+                        'residual_1_minus_R_minus_T':1-closure,
+                        'reflection_y_um':c['model'].get('sim',{}).get('reflection_y_um'),
+                        'transmission_y_um':c['model'].get('sim',{}).get('transmission_y_um'),
+                        'absorption_present':q.get('absorption_present',False),
+                        'check_kind':q.get('energy_check_kind','lossless_flux_closure'),
+                    })
+                materials=verified['metadata'].get('materials',{})
+                for role,material in materials.get('roles',{}).items():
+                    case_material_rows.append({
+                        'case_id':c['id'],'role':role,'kind':material['kind'],
+                        'name':material.get('name','<Object defined dielectric>'),
+                        'wavelength_nm':float(r['lambda_nm'][0]),
+                        'fit_n':material['n'],'fit_k':material['k'],
+                        'raw_n':material['raw_n'],'raw_k':material['raw_k'],
+                        'fit_wavelength_range_nm':json.dumps(materials.get('fit_wavelength_range_nm')),
+                        'material_databases':json.dumps(materials.get('material_databases',[]),ensure_ascii=False),
+                    })
                 # These are QA flags only, not a claim of true physics convergence.
                 if (c['model'].get('ridge_shift_nm',0)==0 and
                     c['model'].get('ridge_center_offsets_nm',[0,0,0])==[0,0,0] and
@@ -171,6 +200,8 @@ def make_report(output:Path,cases:list,cfg:dict):
                         case_qc.append((c['id'],'Symmetry ±1 phase (deg)',phase_pair*180/math.pi))
                 rec.update(verified)
                 rows.extend(case_rows)
+                material_rows.extend(case_material_rows)
+                power_rows.extend(case_power_rows)
                 qc.extend(case_qc)
             except Exception as ex:
                 rec['state']='RESULT_READ_ERROR'
@@ -183,6 +214,15 @@ def make_report(output:Path,cases:list,cfg:dict):
         w=csv.DictWriter(f,fieldnames=cols);w.writeheader();w.writerows(rows)
     with (output/'quality_warnings.csv').open('w',encoding='utf-8-sig',newline='') as f:
         w=csv.writer(f);w.writerow(['case_id','test','value']);w.writerows(qc)
+    for filename,records,columns in (
+            ('material_summary.csv',material_rows,['case_id','role','kind','name','wavelength_nm',
+             'fit_n','fit_k','raw_n','raw_k','fit_wavelength_range_nm','material_databases']),
+            ('power_summary.csv',power_rows,['case_id','polarization','R','T_internal_plane',
+             'residual_1_minus_R_minus_T','reflection_y_um','transmission_y_um',
+             'absorption_present','check_kind'])):
+        with (output/filename).open('w',encoding='utf-8-sig',newline='') as f:
+            writer=csv.DictWriter(f,fieldnames=columns)
+            writer.writeheader();writer.writerows(records)
     with (output/'status_overview.csv').open('w',encoding='utf-8-sig',newline='') as f:
         w=csv.writer(f);w.writerow(['case_id','group','parameter','value','status','elapsed_seconds','log','error'])
         for c in cases:
@@ -310,11 +350,30 @@ def make_report(output:Path,cases:list,cfg:dict):
     body.append('<h1>AH53 Experiment Runner: 计算报告</h1>')
     body.append('<p><b>注意：</b>只展示通过配置摘要、源码指纹、文件校验和与完整性检查的本地求解结果；这些检查不代表电磁计算已经收敛或校准。<br>对角Jones系数由FDTD场投影得到；二维解耦模型的交叉项按对称性设零，CSV的source列记录来源。Jones 复相位在通过 Fresnel 与相位参考验证前均属于<b>研究性结果</b>。</p>')
     body.append('<p><a href="coefficients_long.csv">完整复矩阵数据（CSV）</a>　<a href="status_overview.csv">任务状态</a>　<a href="quality_warnings.csv">质量预警</a></p>')
+    body.append('<p><a href="material_summary.csv">实际材料与 n、k（CSV）</a>　<a href="power_summary.csv">功率与监视器位置（CSV）</a></p>')
+    body.append('<p>材料表中的 fit n、k 是当前波长与拟合波段下实际使用的 FDTD 材料拟合值；raw n、k 是材料库插值值。两者可能不同。T 是所列基底内部平面的向下功率，吸收基底中随深度减小；不能直接当作界面透射或与 RCWA 终端透射相等。1−R−T 是监视器之间的功率余量，包含吸收与数值误差，<b>不是独立测得的吸收率</b>。有吸收时只检查被动性上界 R+T≤1；无吸收时仍检查 R+T≈1。</p>')
+    body.append(f'<p>仅当原始材料 raw k=0 且拟合 k≤{EFFECTIVE_ABSORPTION_K_THRESHOLD:g} 时，微小拟合损耗归入近似无损，仍执行严格的 R+T≈1 检查；实际拟合 k 完整保留。原始材料 raw k&gt;0 的弱吸收材料继续按吸收材料处理。作为尺度参考，k=1e−8 在 643 nm 下传播 1.05 µm 的均匀介质单程强度衰减约 2.05e−7；这不是任意谐振结构的吸收上界。</p>')
     body.append('<h2>任务汇总</h2><table><tr><th>组</th><th>已完成/总数</th><th>参数</th></tr>')
     for group,cc in groups.items():
         ndone=sum(report_records[c['id']]['state']=='DONE' and 'result' in report_records[c['id']] for c in cc)
         body.append(f'<tr><td>{html.escape(group)}</td><td>{ndone}/{len(cc)}</td><td>{html.escape(cc[0]["parameter"])}</td></tr>')
     body.append('</table>')
+    if material_rows:
+        body.append('<h2>实际材料</h2><table><tr><th>Case / 部位</th><th>材料</th><th>波长 nm</th><th>fit n / k</th><th>raw n / k</th></tr>')
+        for item in material_rows:
+            body.append('<tr><td>'+html.escape(item['case_id']+' / '+item['role'])+'</td><td>'
+                        +html.escape(item['name'])+f'</td><td>{item["wavelength_nm"]:g}</td>'
+                        +f'<td>{item["fit_n"]:.8g} / {item["fit_k"]:.8g}</td>'
+                        +f'<td>{item["raw_n"]:.8g} / {item["raw_k"]:.8g}</td></tr>')
+        body.append('</table>')
+    if power_rows:
+        body.append('<h2>功率与吸收相关量</h2><table><tr><th>Case / 偏振</th><th>R</th><th>T（内部平面）</th><th>1−R−T</th><th>T 平面 y / µm</th></tr>')
+        for item in power_rows:
+            body.append('<tr><td>'+html.escape(item['case_id']+' / '+item['polarization'])
+                        +f'</td><td>{item["R"]:.8g}</td><td>{item["T_internal_plane"]:.8g}</td>'
+                        +f'<td>{item["residual_1_minus_R_minus_T"]:.8g}</td><td>'
+                        +html.escape(str(item['transmission_y_um']))+'</td></tr>')
+        body.append('</table>')
     if qc:
         body.append('<h2>质量检查警告</h2><table><tr><th>Case</th><th>检查项</th><th>数值</th></tr>')
         for case_id,check,value in qc:

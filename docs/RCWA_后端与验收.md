@@ -1,8 +1,10 @@
 # 隔离 RCWA 后端
 
-本阶段仅支持空气上方正入射、无损且各向同性的恒定实折射率、平面界面、矩形 AH53 和共享几何生成器已有的矩形膜层。斜壁、损耗、各向异性、斜入射、越过周期边界的条纹和不同参考面明确拒绝。材料数值与几何均来自本工程 `build_geometry`；旧 `RCWA_Lumerical_Benchmarks` 的 n=1.45 数值不作为本工程 n=1.5 的验证结果。
+支持空气上方正入射、各向同性的恒定实折射率，以及通过 `.mdf` 导入的无增益色散/吸收体材料；支持平面界面、矩形 AH53 和共享几何生成器已有的矩形膜层。斜壁、各向异性、斜入射、越过周期边界的条纹和不同参考面明确拒绝。材料与几何均来自本工程配置和 `build_geometry`；旧 `RCWA_Lumerical_Benchmarks` 的 n=1.45 数值不作为本工程 n=1.5 的验证结果。
 
-`ah53runner/rcwa.py` 独立于 FDTD solver、runner、artifacts、report。坐标作正旋转 `(x,y,z) -> (x,z,-y)`，行列式为 +1，使用本机已验证的 z 轴 Forward、`2D Y-normal`。RCWA 外界面固定在旋转后 z=-1800 nm（入射/反射）和 z=+1050 nm（透射），与 AH53 y=1.80/-1.05 μm 对应；膜厚变化不移动参考面。
+下文原有流程针对常数实折射率。使用 MDF 时先读 [材料逐步教程](MDF材料逐步教程.md)，再按本文末尾的“命名材料专用流程”操作。两条路径使用不同验收证书，不能把无损 n=1.5 的通过结果用于新材料。
+
+`ah53runner/rcwa.py` 独立于 FDTD solver、runner、artifacts、report。坐标作正旋转 `(x,y,z) -> (x,z,-y)`，行列式为 +1，使用本机已验证的 z 轴 Forward、`2D Y-normal`。常数无损路径的 RCWA 外界面固定在旋转后 z=-1800 nm（入射/反射）和 z=+1050 nm（透射），与 AH53 y=1.80/-1.05 μm 对应；膜厚变化不移动参考面。吸收材料路径的反射参考面保持相同，终止透射面则按显式吸收层厚度设置，见本文末尾。
 
 ## 可先执行的离线操作
 
@@ -63,7 +65,7 @@ $lumPython = 'D:\Ansys Inc\v252\Lumerical\python\python.exe'
 
 `rcwa_phase_calibration.json` 使用 schema 2，只有原有 43 项控制/收敛检查和新增绝对原点检查均通过才为 PASS，明确标记 `VERIFIED_ABSOLUTE_X0`。证书分别绑定主控制和四份 Born 控制的冻结输入、完整原始文件 SHA256、状态 SHA256、真实版本、网格/截断、全部候选逐阶结果与解析工具源码 SHA256；弱空气控制不扩大 n=1.5 的目标范围。每次导出重新核验全部 10 份证据并纯计算重建完整证书；完整 canonical 内容必须相等，没有时间戳参与数学证书。`--origin-config` 的当前冻结输入计划也必须与四份证据相同。
 
-后端指纹包括 `rcwa.py`、共享 `geometry.py` 和 Born 验收工具源码。数学变动后必须真实重新采集 6+4 例；旧指纹不能迁移或改写为新指纹。旧 schema 1 或仅相对 half_cell 的证书不能导出绝对相位。
+后端指纹包括 `rcwa.py`、共享 `geometry.py`、`materials.py` 和 Born 验收工具源码。数学变动后必须真实重新采集 6+4 例；旧指纹不能迁移或改写为新指纹。旧 schema 1 或仅相对 half_cell 的证书不能导出绝对相位。
 
 每次验收的完整 PASS/FAIL 副本均保留在 `calibration_attempts/`，切换注册候选或重算不会抹去前次失败。
 
@@ -84,3 +86,74 @@ $lumPython = 'D:\Ansys Inc\v252\Lumerical\python\python.exe'
 原生 `Rps` 是 p 入射、s 出射，矩阵排列为 `[[Rss,Rps],[Rsp,Rpp]]`。逐阶偏振转换由 Cartesian 场及实际波矢构造，独立核验 characterization 的转换值；不能只给所有 Rpp 统一乘负号。功率还与原生 `grating_orders`、`total_energy` 交叉核验。
 
 接口定义参考官方 [RCWA Simulation Object](https://optics.ansys.com/hc/en-us/articles/12959229278611-RCWA-Solver-Simulation-Object)、[Source polarization](https://optics.ansys.com/hc/en-us/articles/4414575008787-RCWA-Solver-Introduction) 和 [RCWA resources](https://optics.ansys.com/hc/en-us/articles/15337068502675-RCWA-Resource-Configuration)。在线文档包含晚于本机 2025 R2 的选项，实际 API 与版本记录优先。
+
+## 命名材料专用流程
+
+先完成 [MDF 教程](MDF材料逐步教程.md)第 1～5 步，确保本机已有 `materials/ah53_demo.mdf`。下面所有命令都在项目根目录的 PowerShell 中执行，使用前文的 `$lumPython`。
+
+### A. 先做三个平面界面
+
+```powershell
+& $lumPython tools/materials.py check --config configs/materials_rcwa_planar.json
+& $lumPython tools/run_rcwa.py plan --config configs/materials_rcwa_planar.json
+& $lumPython tools/run_rcwa.py run --config configs/materials_rcwa_planar.json
+& $lumPython tools/run_rcwa.py calibrate-materials --config configs/materials_rcwa_planar.json
+& $lumPython tools/run_rcwa.py export-materials --config configs/materials_rcwa_planar.json
+```
+
+逐条执行，某条失败时先查看原因，不要继续导出。`run` 保存真实求解结果；`calibrate-materials` 从这些结果重新计算物理检查；`export-materials` 只在材料专用证书有效时导出统一系数。
+
+这个配置在 643 nm 检查 Silica、Silicon、Gold 三个平面，明确使用 256 个横向网格点。本机 2025 R2 会把较小的 160 点请求提高为 256；程序要求实际网格与冻结配置一致，因此示例直接填写实际可用设置。另一个波长的独立例子：
+
+```powershell
+& $lumPython tools/run_rcwa.py run --config configs/materials_rcwa_planar_780.json
+& $lumPython tools/run_rcwa.py calibrate-materials --config configs/materials_rcwa_planar_780.json
+& $lumPython tools/run_rcwa.py export-materials --config configs/materials_rcwa_planar_780.json
+```
+
+780 nm 使用单独配置与证书。一个证书要求波长、周期、拟合范围和材料库一致。平面结构只有零阶反射，验收使用复 Fresnel 公式；它不证明非零衍射阶的横向绝对相位。
+
+输出分别位于 `output_ah53_materials_rcwa_planar` 和 `output_ah53_materials_rcwa_planar_780`。材料证书名为 `rcwa_material_calibration.json`。原始采集状态中的 `PHASE_UNCALIBRATED` 表示保留的是未独立认证的原始证据；统一导出是否获准由证书决定。
+
+### B. 带膜 AH53 的完整材料验收
+
+**本机状态：这套带膜流程尚未整组验收完成。** 用户要求停止继续测试并直接推送后，队列已停止；已完成结果与中断现场保留。下面是继续计算的操作流程，不代表已有可用的带膜材料 PASS 证书。已通过的平面材料与旧常数材料回归见 [材料验收记录](MDF材料验收记录.md)。
+
+示例为 **硅基底、硅条纹、100 nm 平坦化二氧化硅膜**。配置同时包含两种材料的平面对照、光栅零位移与 +100 nm 位移，每种使用两个数值网格，共 8 个采集。另有 4 个独立弱散射原点控制。
+
+弱散射控制沿用旧常数材料流程，因此先完成当前代码下的 FDTD 门禁：
+
+```powershell
+& $lumPython run_experiments.py run --config configs/physics_validation.json
+& $lumPython tools/validate_physics.py
+& $lumPython run_experiments.py run --config configs/quick_check.json
+& $lumPython tools/run_validated_overnight.py
+```
+
+最后一条只检查门禁，不加 `--execute` 就不会运行 39 点队列。之后：
+
+```powershell
+& $lumPython tools/materials.py check --config configs/materials_rcwa_validation.json
+& $lumPython tools/run_rcwa.py run --config configs/materials_rcwa_origin.json
+& $lumPython tools/run_rcwa.py run --config configs/materials_rcwa_validation.json
+& $lumPython tools/run_rcwa.py calibrate-materials --config configs/materials_rcwa_validation.json --origin-config configs/materials_rcwa_origin.json
+& $lumPython tools/run_rcwa.py export-materials --config configs/materials_rcwa_validation.json --origin-config configs/materials_rcwa_origin.json
+```
+
+结果位于 `output_ah53_materials_rcwa_validation`。各案例的层级目录包含原生数据、实际材料解析、模型和导出结果。较粗与较细设置分别为 1920/3200 个横向采样点、208/320 的 k-vector 设置。本机在 k-vector=208 时会提高原先的 1600 点请求；1920 点同时满足实际读取一致性及 100 nm 位移的网格对齐。具体几何、网格及求解设置必须保留在证书覆盖范围内。
+
+### C. 换自己的材料或膜厚
+
+材料字段与 FDTD 相同。复制配置后，修改 MDF 路径、材料名和输出目录；每个实际使用的命名材料都要有对应平面控制。对于有衍射的每一种膜厚/几何组合，还要提供零位移及非零位移控制，并实际运行两个网格和对应原点控制。仅把已经通过的证书复制到新目录不能授权新结果。
+
+可以先用 `plan` 检查几何，再用 `run --limit 1` 采集一个点。失败案例使用 `run --retry-failed` 重试。`calibrate-materials` 的证书只覆盖其实际检查的那些采集，不是任意材料或任意扫描点的通行证。
+
+### D. 吸收基底和透射含义
+
+Lumerical RCWA 的最终半空间不能直接表达吸收。程序将其展开为显式的厚吸收层，并在更深处放置声明的无损终止介质；实际计算深度 D 和 2D，要求所有传播反射阶的复幅值收敛、总反射功率收敛。材料库的三个方向响应先独立核验各向同性，再核对 RCWA 原生 `index_z`（或实际返回的多个方向 index）与拟合值一致；本机 2025 R2 的二维各向同性结果只返回 `index_z`，程序不补造缺失分量。
+
+默认终止介质折射率为 1。输出记录真实采用的吸收层厚度和终止介质；终止处 T 属于这个辅助计算模型，**不是 FDTD 在基底内固定 `y=-1.05 μm` 处测得的 T**。本次跨后端对照只比较共同空气端口的反射。吸收情况下检查被动性与上述独立控制，不把 `A=1-R-T` 自身当作独立能量验证。
+
+对于原始 k=0、拟合只产生 `0<k≤1e-8` 的材料，RCWA 保留材料拟合记录，并明确记录最终半空间忽略这点拟合损耗的近似、界面反射差和内部参考深度的衰减估计；不会为数值级拟合损耗建立不合理的巨大吸收层。原始数据的 k>0 时不使用这个例外。
+
+上述处理依据官方 [RCWA 关于吸收材料的限制](https://optics.ansys.com/hc/en-us/articles/4414575008787-RCWA-Solver-Introduction)。后续若要研究有限厚基底、背面反射或完整透射复幅值，需要明确建立对应物理模型。

@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from pathlib import Path
 import numpy as np
 from .geometry import build_geometry, shapes_to_json
+from .materials import (EFFECTIVE_ABSORPTION_K_THRESHOLD, fit_range_nm,
+                        is_effectively_absorbing, resolve_materials, verify_material_databases)
 
 C0=299792458.0
 NM=1e-9
@@ -95,7 +97,16 @@ def add_rect(fdtd, s, zspan):
                         'x span':(s.x2_nm-s.x1_nm)*NM,
                         'y min':s.y1_nm*NM,'y max':s.y2_nm*NM,
                         'z':0.0,'z span':zspan})
-    set_props(fdtd,{'material':'<Object defined dielectric>','index':float(s.index_n)})
+    if s.material_name is not None:
+        set_props(fdtd, {'material': s.material_name})
+        if str(fdtd.get('material')) != s.material_name:
+            raise ValueError(f'{s.name}: assigned material readback differs from {s.material_name!r}.')
+    else:
+        set_props(fdtd,{'material':'<Object defined dielectric>','index':float(s.index_n)})
+        recorded = np.asarray(fdtd.get('index')).reshape(-1)
+        if (str(fdtd.get('material')) != '<Object defined dielectric>' or len(recorded) != 1
+                or not np.isclose(float(recorded[0]), s.index_n, rtol=1e-12, atol=0)):
+            raise ValueError(f'{s.name}: constant material/index readback differs from requested index.')
 
 
 def add_line_monitor(fdtd,name,y,P,lam):
@@ -119,6 +130,7 @@ def build_model(fdtd, shapes, top_nm, cfg, capture_field):
     sim=cfg['sim']
     P=cfg['period_nm']*NM
     lam=cfg['wavelength_nm']*NM
+    fit_lo, fit_hi = fit_range_nm(cfg)
     y_min=sim['y_min_um']*1e-6
     y_max=sim['y_max_um']*1e-6
     src=sim['source_y_um']*1e-6
@@ -159,8 +171,8 @@ def build_model(fdtd, shapes, top_nm, cfg, capture_field):
                     'direction':'backward','plane wave type':'Bloch/periodic',
                     'x':0.0,'x span':P,'y':src,
                     'angle theta':0,'polarization angle':90,
-                    'wavelength start':lam-100*NM,
-                    'wavelength stop':lam+100*NM})
+                    'wavelength start':fit_lo*NM,
+                    'wavelength stop':fit_hi*NM})
     fdtd.setglobalmonitor('use source limits',False)
     fdtd.setglobalmonitor('wavelength center',lam)
     fdtd.setglobalmonitor('wavelength span',0.0)
@@ -170,7 +182,7 @@ def build_model(fdtd, shapes, top_nm, cfg, capture_field):
     add_line_monitor(fdtd,'INC2',inc2,P,lam)
     if capture_field:
         add_field_monitor(fdtd,P,sim,lam)
-    return {'ref':ref,'r':mon_r,'inc1':inc1,'inc2':inc2,'P':P,'lam':lam}
+    return {'ref':ref,'r':mon_r,'t':mon_t,'inc1':inc1,'inc2':inc2,'P':P,'lam':lam}
 
 
 def fld(fdtd,monitor,component):
@@ -227,6 +239,7 @@ def retrieve_nearfield(fdtd, case_dir, pol, incident_amplitude):
 def run_case(case:dict, case_dir:Path, api_path:str, visible:bool=False)->dict:
     lumapi=load_lumapi(api_path)
     cfg=case['model']
+    verify_material_databases(cfg)
     shapes,top_nm,meta=build_geometry(cfg)
     metadata={'case_id':case['id'],'digest':case['digest'],
               'solver_fingerprint':case.get('solver_fingerprint'),
@@ -241,7 +254,24 @@ def run_case(case:dict, case_dir:Path, api_path:str, visible:bool=False)->dict:
     with lumapi.FDTD(hide=(not visible)) as fdtd, local_cpu_resource(fdtd) as resource:
         metadata['lumerical_version']=fdtd.version()
         metadata['resource']=resource
+        materials = resolve_materials(fdtd, cfg)
+        metadata['materials'] = materials
+        absorbing = any(is_effectively_absorbing(role) for role in materials['roles'].values())
+        if absorbing:
+            metadata['physical_model'] = '2D passive isotropic dispersive absorbing XY'
+        elif any(role['kind'] == 'database' for role in materials['roles'].values()):
+            metadata['physical_model'] = '2D passive isotropic dispersive XY'
+        material_file = case_dir/'material_resolution.json'
+        material_file.write_text(json.dumps(materials, indent=2, allow_nan=False), encoding='utf8')
+        metadata['material_resolution_sha256'] = hashlib.sha256(material_file.read_bytes()).hexdigest()
         coords=build_model(fdtd,shapes,top_nm,cfg,case.get('capture_field',False))
+        metadata['power_monitor_planes'] = {
+            'reflection_y_um': coords['r']*1e6,
+            'transmission_y_um': coords['t']*1e6,
+            'transmission_medium': 'substrate',
+            'transmission_definition': 'Downward power flux at the stated internal substrate plane; includes attenuation above this plane.',
+            'residual_definition': '1-R-T_plane; unaccounted flux between monitors, including absorption and numerical error; not independently measured absorption.',
+        }
         fdtd.save(str((case_dir/'AH53_model.fsp').resolve()))
         structure_names=[s.name for s in shapes]
 
@@ -309,6 +339,8 @@ def run_case(case:dict, case_dir:Path, api_path:str, visible:bool=False)->dict:
         E_s=fld(fdtd,'R','Ez')
         Rmon_s=source_flux(fdtd,'R')
         Tmon_s=source_flux(fdtd,'T')
+        signed_R_s=num_1(fdtd.transmission('R'))
+        signed_T_s=num_1(fdtd.transmission('T'))
         nearfield_warnings=[]
         if case.get('capture_field',False):
             try:retrieve_nearfield(fdtd,case_dir,'s',s_inc_ref)
@@ -321,6 +353,8 @@ def run_case(case:dict, case_dir:Path, api_path:str, visible:bool=False)->dict:
         E_p_y=fld(fdtd,'R','Ey')
         Rmon_p=source_flux(fdtd,'R')
         Tmon_p=source_flux(fdtd,'T')
+        signed_R_p=num_1(fdtd.transmission('R'))
+        signed_T_p=num_1(fdtd.transmission('T'))
         if case.get('capture_field',False):
             try:retrieve_nearfield(fdtd,case_dir,'p',p_inc_ref)
             except Exception as exc:
@@ -356,6 +390,17 @@ def run_case(case:dict, case_dir:Path, api_path:str, visible:bool=False)->dict:
                  'flux_decomposition_error_p':abs(Rmon_p-float(np.sum(eta_p))),
                  'power_closure_s':Rmon_s+Tmon_s,
                  'power_closure_p':Rmon_p+Tmon_p,
+                 'absorption_present':absorbing,
+                 'absorption_k_threshold':EFFECTIVE_ABSORPTION_K_THRESHOLD,
+                 'absorption_classification':'Raw k>0 always remains absorbing; only raw-lossless materials with fitted k<=threshold use the strict lossless closure check. Actual fitted k is retained.',
+                 'maximum_fitted_k':max(role['k'] for role in materials['roles'].values()),
+                 'energy_check_kind':'passive_flux_bound' if absorbing else 'lossless_flux_closure',
+                 'energy_residual_s':1-Rmon_s-Tmon_s,
+                 'energy_residual_p':1-Rmon_p-Tmon_p,
+                 'signed_reflection_flux_s':signed_R_s,
+                 'signed_reflection_flux_p':signed_R_p,
+                 'signed_transmission_flux_s':signed_T_s,
+                 'signed_transmission_flux_p':signed_T_p,
                  'incident_spatial_phase_sign':sign_in,
                  'air_reference_reflected_s':reference_R_s,
                  'air_reference_reflected_p':reference_R_p,
@@ -369,5 +414,6 @@ def run_case(case:dict, case_dir:Path, api_path:str, visible:bool=False)->dict:
                          'layers':int(cfg['sim'].get('pml_layers',16))}
         metadata['reflection_power_note']='total_reflected is raw monitor flux; eta uses air-background-subtracted E. Compare only after the reference leakage gate passes.'
         metadata['result_sha256']=hashlib.sha256((case_dir/'result.npz').read_bytes()).hexdigest()
+        verify_material_databases(cfg)
     (case_dir/'physics_metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
     return quality

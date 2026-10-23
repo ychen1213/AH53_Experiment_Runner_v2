@@ -5,6 +5,7 @@
 ah53runner/solver.py -text
 ah53runner/geometry.py -text
 ah53runner/rcwa.py -text
+ah53runner/materials.py -text
 tools/validate_rcwa_origin.py -text
 
 *.bat text eol=crlf

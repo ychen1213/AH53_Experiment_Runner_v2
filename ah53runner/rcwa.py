@@ -9,6 +9,7 @@ No complete two-sided multi-order S matrix is claimed.
 from __future__ import annotations
 
 from dataclasses import asdict
+import copy
 import hashlib
 import json
 import math
@@ -17,6 +18,9 @@ from pathlib import Path
 import numpy as np
 
 from .geometry import build_geometry
+from .materials import (has_named_materials, material_spec, fit_range_nm,
+                        verify_material_databases, is_effectively_absorbing,
+                        EFFECTIVE_ABSORPTION_K_THRESHOLD)
 
 ROTATION = np.array([[1., 0., 0.], [0., 0., 1.], [0., -1., 0.]])
 DATASETS = ('grating_characterization', 'field_amplitudes', 'grating_orders',
@@ -46,7 +50,8 @@ def backend_fingerprint():
     digest = hashlib.sha256()
     # The independent Born evaluator is part of the export gate's mathematics.
     # Changing it requires real reacquisition, just like changing this adapter.
-    for path in (Path(__file__), Path(__file__).with_name('geometry.py'), ORIGIN_TOOL):
+    for path in (Path(__file__), Path(__file__).with_name('geometry.py'),
+                 Path(__file__).with_name('materials.py'), ORIGIN_TOOL):
         digest.update(path.name.encode('utf8'))
         digest.update(path.read_bytes())
     return digest.hexdigest()[:16]
@@ -82,13 +87,19 @@ def geometry_spec(model):
     boxes = []
     for shape in shapes:
         require(not shape.vertices_nm, 'Polygon/sloped geometry is unsupported; no rectangle substitution is allowed.')
-        values = (shape.index_n, shape.x1_nm, shape.x2_nm, shape.y1_nm, shape.y2_nm)
+        values = (shape.x1_nm, shape.x2_nm, shape.y1_nm, shape.y2_nm)
         require(all(math.isfinite(float(value)) for value in values), 'Nonfinite shared geometry.')
-        require(shape.index_n > 0, 'Indices must be positive real constants.')
-        boxes.append({'name': shape.name, 'material': shape.material, 'n': float(shape.index_n),
+        named = getattr(shape, 'material_name', None)
+        require(named or (shape.index_n is not None and math.isfinite(shape.index_n) and shape.index_n > 0),
+                'Indices must be positive real constants or an explicit database material.')
+        box = {'name': shape.name, 'material': shape.material,
+                      'n': None if named else float(shape.index_n),
                       'x_min_nm': float(shape.x1_nm), 'x_max_nm': float(shape.x2_nm),
                       'y_min_nm': -invariant_span_nm/2, 'y_max_nm': invariant_span_nm/2,
-                      'z_min_nm': -float(shape.y2_nm), 'z_max_nm': -float(shape.y1_nm)})
+                      'z_min_nm': -float(shape.y2_nm), 'z_max_nm': -float(shape.y1_nm)}
+        if named:
+            box['material_name'] = named
+        boxes.append(box)
     reference = 1800.
     transmitted = 1050.
     require(top < reference, 'Geometry intersects the fixed incident/reflection reference plane.')
@@ -99,26 +110,34 @@ def geometry_spec(model):
     zmin, zmax = -1000. * float(sim['y_max_um']), -1000. * float(sim['y_min_um'])
     require(zmin < -reference < transmitted < zmax,
             'RCWA simulation region must enclose the fixed outer interfaces.')
-    return {'geometry_source': 'ah53runner.geometry.build_geometry',
+    spec = {'geometry_source': 'ah53runner.geometry.build_geometry',
             'rotation_original_to_rcwa': ROTATION.tolist(),
             'coordinate_map': '(x,y,z)_AH53 -> (x,z,-y)_RCWA; proper rotation det=+1',
             'period_nm': float(model['period_nm']), 'wavelength_nm': float(model['wavelength_nm']),
-            'n_incident': 1., 'n_substrate': float(model['n_substrate']),
+            'n_incident': 1., 'n_substrate': material_spec(model, 'substrate').get('n'),
             'source_reference_z_nm': -reference, 'reflection_reference_z_nm': -reference,
             'transmission_reference_z_nm': transmitted, 'interfaces_nm': interfaces,
             'solver_z_min_nm': zmin, 'solver_z_max_nm': zmax,
             'source_shapes_xy_nm': [asdict(shape) for shape in shapes],
             'boxes': boxes, 'geometry_metadata': metadata}
+    if has_named_materials(model):
+        spec['material_databases'] = model.get('material_databases', [])
+        spec['fit_wavelength_range_nm'] = list(fit_range_nm(model))
+    return spec
 
 
 def validate_settings(settings, model):
-    require(set(settings) <= {'name', 'mesh_cells_x', 'max_number_k_vectors', 'conversion_absolute'},
+    require(set(settings) <= {'name', 'mesh_cells_x', 'max_number_k_vectors', 'conversion_absolute',
+                             'substrate_depth_nm', 'termination_index'},
             'Unsupported RCWA settings; refusing to ignore unknown properties.')
     for key in ('mesh_cells_x', 'max_number_k_vectors'):
         value = settings.get(key)
         require(isinstance(value, int) and not isinstance(value, bool) and value > 0,
                 f'{key} must be a positive integer.')
-    maximum = math.floor(float(model['n_substrate']) * float(model['period_nm']) /
+    # A named substrate is resolved only in a real CAD session. Planning checks
+    # air-port sampling; the resolved terminal port is checked before execution.
+    n_substrate = material_spec(model, 'substrate').get('n', 1.)
+    maximum = math.floor(float(n_substrate) * float(model['period_nm']) /
                          float(model['wavelength_nm']) + 1e-9)
     require(settings['max_number_k_vectors'] >= 2*maximum+3,
             'Conservative truncation requires both signs of every propagating substrate order plus an evanescent pair; actual native orders are checked separately.')
@@ -127,11 +146,91 @@ def validate_settings(settings, model):
     tolerance = float(settings.get('conversion_absolute', 1e-8))
     require(math.isfinite(tolerance) and 0 < tolerance <= 1e-6,
             'conversion_absolute must be positive and <=1e-6.')
+    for name in ('substrate_depth_nm', 'termination_index'):
+        if name in settings:
+            require(math.isfinite(float(settings[name])) and float(settings[name]) > 0,
+                    name + ' must be positive and finite.')
+            require(has_named_materials(model), name + ' is only used by the named-material path.')
 
 
-def build_lsf(spec, settings):
+def resolved_geometry(spec, materials, settings, depth_multiplier=1.):
+    """Explicit RCWA representation of the thick physical substrate.
+
+    RCWA discards loss in its final half-space. A lossy substrate is therefore
+    an internal layer terminating in a declared real medium; its artificial
+    back interface must pass a separately acquired doubled-depth check.
+    """
+    actual = copy.deepcopy(spec)
+    roles = materials['roles']
+    for box in actual['boxes']:
+        record = roles[box['material']]
+        if box.get('material_name'):
+            require(record.get('name') == box['material_name'], 'Material resolution/name mismatch.')
+        box['n'] = float(record['n'])
+        box['k'] = float(record['k'])
+    sub = roles['substrate']
+    actual['n_substrate'] = float(sub['n'])
+    actual['k_substrate'] = float(sub['k'])
+    actual['material_resolution'] = copy.deepcopy(materials)
+    lossy = is_effectively_absorbing(sub)
+    actual['absorbing_substrate'] = lossy
+    actual['terminal_index'] = float(sub['n'])
+    actual['transmission_scope'] = 'lossless_substrate_reference_plane'
+    # The MCM fit of raw lossless data can have tiny positive numerical k.
+    # Keep that fitted value in objects/provenance. Only the native final
+    # half-space (which cannot represent k) uses its real part, explicitly.
+    tiny_fit_loss = not lossy and float(sub['k']) > 0
+    actual['terminal_negligible_fit_loss_approximation'] = {
+        'applied': tiny_fit_loss, 'fitted_n': float(sub['n']), 'fitted_k': float(sub['k']),
+        'raw_k': float(sub.get('raw_k', sub['k'])),
+        'fitted_k_threshold': EFFECTIVE_ABSORPTION_K_THRESHOLD,
+        'policy': 'Only raw k<=0 and fitted 0<k<=threshold qualifies. Native final half-space uses Re(n); finite layers keep the complete named material. Actual n/k are never overwritten.',
+        'single_pass_intensity_loss_over_internal_depth': float(-math.expm1(
+            -4*math.pi*float(sub['k'])*spec['transmission_reference_z_nm']/spec['wavelength_nm'])),
+        'air_interface_complex_Fresnel_difference': float(abs(
+            (1-complex(sub['n'], sub['k']))/(1+complex(sub['n'], sub['k']))
+            - (1-float(sub['n']))/(1+float(sub['n']))))}
+    if tiny_fit_loss:
+        actual['transmission_scope'] = 'substrate_reference_plane_with_declared_negligible_fit_loss_final_halfspace'
+    if lossy:
+        require(float(sub['k']) > 0,
+                'Material data indicates absorption but the fitted target k is not positive; improve the material fit before constructing an absorbing substrate.')
+        depth = float(settings.get('substrate_depth_nm', max(
+            2 * spec['transmission_reference_z_nm'],
+            spec['wavelength_nm'] * math.log(1e10) / (4 * math.pi * float(sub['k'])))))
+        depth *= depth_multiplier
+        require(depth > spec['transmission_reference_z_nm'],
+                'Absorbing substrate must extend below the FDTD internal transmission plane.')
+        terminal = float(settings.get('termination_index', 1.))
+        substrate_boxes = [b for b in actual['boxes'] if b['material'] == 'substrate']
+        require(len(substrate_boxes) == 1, 'Expected one uniform substrate rectangle.')
+        substrate_boxes[0]['z_max_nm'] = depth
+        termination = dict(substrate_boxes[0], name='rcwa_lossless_termination',
+                           material='rcwa_terminal', n=terminal, k=0.,
+                           z_min_nm=depth, z_max_nm=depth+1000.)
+        termination.pop('material_name', None)
+        actual['boxes'].append(termination)
+        actual['interfaces_nm'] = sorted(set(spec['interfaces_nm']) | {depth})
+        actual['solver_z_max_nm'] = depth + 500.
+        actual['transmission_reference_z_nm'] = depth
+        actual['internal_fdtd_transmission_z_nm'] = spec['transmission_reference_z_nm']
+        actual['substrate_depth_nm'] = depth
+        actual['terminal_index'] = terminal
+        actual['transmission_scope'] = 'artificial_lossless_terminal_after_absorbing_substrate'
+    nout = actual['terminal_index']
+    maximum = math.floor(nout * actual['period_nm'] / actual['wavelength_nm'] + 1e-9)
+    require(settings['max_number_k_vectors'] >= 2*maximum+3,
+            'Resolved terminal index requires more Fourier orders; increase max_number_k_vectors and mesh_cells_x.')
+    return actual
+
+
+def build_lsf(spec, settings, *, new_project=True, run=True):
     """Build one native RCWA project; this function performs no API operation."""
-    lines = ['# Shared AH53 geometry, rotated to RCWA z/forward. SI units.', 'newproject;']
+    lines = ['# Shared AH53 geometry, rotated to RCWA z/forward. SI units.']
+    if new_project:
+        lines.append('newproject;')
+        for database in spec.get('material_databases', []):
+            lines.append('importmaterialdb(' + json.dumps(database['path'].replace('\\', '/'), ensure_ascii=False) + ');')
     def value(item):
         if isinstance(item, str):
             return json.dumps(item, ensure_ascii=False)
@@ -145,7 +244,11 @@ def build_lsf(spec, settings):
             lines.append(f'set({value(key)},{value(item)});')
     for box in spec['boxes']:
         lines.append('addrect;')
-        properties = {'name': box['name'], 'material': '<Object defined dielectric>', 'index': box['n']}
+        properties = {'name': box['name']}
+        if box.get('material_name'):
+            properties['material'] = box['material_name']
+        else:
+            properties.update(material='<Object defined dielectric>', index=box['n'])
         properties.update({f'{axis} {edge}': box[f'{axis}_{edge}_nm'] * 1e-9
                            for axis in 'xyz' for edge in ('min', 'max')})
         props(properties)
@@ -161,13 +264,24 @@ def build_lsf(spec, settings):
            'max number k vectors': settings['max_number_k_vectors'],
            'use li factorization': 0, 'mesh type': 'custom',
            'mesh cells x': settings['mesh_cells_x'], 'mesh refinement': 'staircase',
-           'fit materials with multi-coefficient model': 0,
+           'fit materials with multi-coefficient model': int('fit_wavelength_range_nm' in spec),
            'incident angle': 'table', 'incident angle table': [[0.,0.]],
            'sample spacing': 'custom',
            'custom frequency samples': [299792458. / (spec['wavelength_nm'] * 1e-9)],
            'report grating characterization': 1, 'report grating orders': 1,
            'report grating power': 1, 'report field amplitudes': 1, 'report index': 1})
-    lines.extend(['save("rcwa_model.fsp");', 'run("RCWA");', 'save("rcwa_model.fsp");'])
+    if 'fit_wavelength_range_nm' in spec:
+        lo, hi = spec['fit_wavelength_range_nm']
+        props({'fit sampled materials': 1, 'fit analytic materials': 1,
+               'override materials frequency range': 1,
+               'materials minimum wavelength': lo * 1e-9, 'materials maximum wavelength': hi * 1e-9})
+    if run:
+        lines.append(run_lsf())
+    return '\n'.join(lines) + '\n'
+
+
+def run_lsf():
+    lines = ['save("rcwa_model.fsp");', 'run("RCWA");', 'save("rcwa_model.fsp");']
     for name in DATASETS:
         lines.append(f'{name}=getresult("RCWA","{name}");')
     lines.append('matlabsave("native_rcwa.mat",' + ','.join(DATASETS) + ');')
@@ -311,10 +425,18 @@ def _total_energy(dataset, name, model):
     return float(array.real.reshape(-1)[0])
 
 
-def convert_native(datasets, model, settings, registration='native'):
+def convert_native(datasets, model, settings, registration='native', resolved_spec=None):
     """Convert raw data in memory for calibration diagnostics; never certifies phase."""
     validate_settings(settings, model)
     geometry_spec(model)
+    if has_named_materials(model):
+        require(isinstance(resolved_spec, dict) and 'material_resolution' in resolved_spec,
+                'Named-material conversion requires the actual resolved material model and terminal medium.')
+        terminal_n = float(resolved_spec['terminal_index'])
+        absorbing = any(is_effectively_absorbing(role)
+                        for role in resolved_spec['material_resolution']['roles'].values())
+    else:
+        terminal_n, absorbing = float(model['n_substrate']), False
     names = tuple(prefix + a + b for prefix in 'RT' for a in 'sp' for b in 'sp')
     orders, gc = _order_attributes(datasets['grating_characterization'], names, model)
     order2, go = _order_attributes(datasets['grating_orders'], ('kx', 'ky', 'Rs_grating', 'Rp_grating', 'Ts_grating', 'Tp_grating'), model)
@@ -333,7 +455,7 @@ def convert_native(datasets, model, settings, registration='native'):
                    'native_to_cartesian_max_error': {}, 'total_power': {}}
     din = np.diag([-1., 1.])
     for prefix, side, nout, sign, direction in (('R', 'r', 1., -1, 'b'),
-                                               ('T', 't', float(model['n_substrate']), 1, 'f')):
+                                               ('T', 't', terminal_n, 1, 'f')):
         q2 = nout ** 2 - kx ** 2
         propagating = q2 > 1e-12
         selected = orders[propagating]
@@ -382,11 +504,96 @@ def convert_native(datasets, model, settings, registration='native'):
         output[f'{side}_power'] = power
         diagnostics['native_to_cartesian_max_error'][prefix] = error
     for pol in 'sp':
-        require(abs(diagnostics['total_power']['R'+pol] + diagnostics['total_power']['T'+pol] - 1.) <= 1e-7,
-                f'Lossless RCWA energy balance fails for {pol}.')
+        total = diagnostics['total_power']['R'+pol] + diagnostics['total_power']['T'+pol]
+        if absorbing:
+            require(-1e-7 <= total <= 1+1e-7, f'Passive RCWA R+T exceeds incident power for {pol}.')
+            diagnostics.setdefault('unreturned_power', {})[pol] = 1.-total
+        else:
+            require(abs(total - 1.) <= 1e-7, f'Lossless RCWA energy balance fails for {pol}.')
+    if resolved_spec is not None:
+        diagnostics['transmission_scope'] = resolved_spec['transmission_scope']
+        diagnostics['energy_check'] = ('Independent native S, Cartesian fields, diffraction powers and total flux; '
+            'passivity bounds only. 1-R-T is a residual, not an independent absorption measurement.'
+            if absorbing else 'Independent native channels and total flux; lossless R+T closure.')
     output['S11'] = output['r_power']
     output['S21'] = output['t_power']
     return output, diagnostics
+
+
+def validate_material_index(dataset, resolved_spec):
+    """Compare actual native complex index values without guessing packed axes."""
+    expected = {complex(1.)}
+    expected.update(complex(box['n'], box.get('k', 0.)) for box in resolved_spec['boxes'])
+    expected = np.asarray(sorted(expected, key=lambda n: (n.real, n.imag)))
+    metadata = dataset.get('Lumerical_dataset', {})
+    names = metadata.get('attributes', [])
+    # Actual v252 isotropic 2D acquisitions expose only index_z, packed by
+    # layer intervals. Do not fabricate missing Cartesian components. Material
+    # metadata plus independently queried x/y/z optical responses establish
+    # isotropy; native index_z checks what the RCWA mesh actually used.
+    scalar = names == ['index_z']
+    require(scalar or (len(names) == 3 and set(names) == {'index_x', 'index_y', 'index_z'}),
+            'Expected native scalar isotropic index_z or three Cartesian index components.')
+    for role in resolved_spec['material_resolution']['roles'].values():
+        if role.get('kind') == 'database':
+            validation = role.get('validation', {})
+            require(validation.get('status') == 'PASS'
+                    and validation.get('cartesian_components_checked') == [1, 2, 3],
+                    'Native scalar index requires independent three-axis material isotropy checks.')
+    arrays = [np.asarray(dataset[name]).reshape(-1) for name in names]
+    require(all(a.shape == arrays[0].shape and np.isfinite(a).all() for a in arrays),
+            'Invalid actual complex material index data.')
+    require(all(np.allclose(a, arrays[0], atol=1e-7, rtol=1e-7) for a in arrays[1:]),
+            'Actual RCWA index is anisotropic; isotropic-only conversion refused.')
+    observed = np.unique(arrays[0])
+    distances = np.abs(observed[:, None]-expected[None, :])
+    require(float(np.max(np.min(distances, axis=1))) <= 1e-6,
+            'Actual RCWA index differs from the declared FDTD MCM fit; no material fallback allowed.')
+    require(float(np.max(np.min(distances, axis=0))) <= 1e-6,
+            'A requested material is absent from the actual RCWA index mesh.')
+    return {'status': 'PASS', 'absolute_index_tolerance': 1e-6,
+            'native_index_representation': ('scalar_isotropic_index_z' if scalar else 'three_cartesian_components'),
+            'native_attributes': names,
+            'isotropy_evidence': 'Independent material metadata and getindex/getfdtdindex components 1,2,3; missing native axes are never fabricated.',
+            'actual_unique_indices': [{'n': float(n.real), 'k': float(n.imag)} for n in observed],
+            'maximum_index_error': float(np.max(np.min(distances, axis=1)))}
+
+
+def substrate_depth_convergence(first, second):
+    """An actual doubled-depth solve must agree in complex air-port reflection."""
+    left, ld = first
+    right, rd = second
+    require(np.array_equal(left['r_orders'], right['r_orders']), 'Depth checks have different reflected orders.')
+    norm = max(float(np.linalg.norm(right['r_E'])), 1e-8)
+    relative = float(np.linalg.norm(left['r_E']-right['r_E']) / norm)
+    absolute = float(np.max(np.abs(left['r_E']-right['r_E'])))
+    power = max(abs(ld['total_power']['R'+p]-rd['total_power']['R'+p]) for p in 'sp')
+    return {'status': 'PASS' if relative <= 1e-4 and power <= 1e-5 else 'FAIL',
+            'complex_relative_l2': relative, 'complex_absolute_max': absolute,
+            'total_reflected_power_absolute': power,
+            'limits': {'complex_relative_l2': 1e-4, 'total_reflected_power_absolute': 1e-5},
+            'scope': 'All propagating air-port complex reflection, depth D versus 2D; terminal T is not FDTD internal flux.'}
+
+
+def verify_actual_material_settings(state, spec, settings):
+    expected = {box['name']: box.get('material_name', '<Object defined dielectric>') for box in spec['boxes']}
+    require(state.get('actual_material_assignments') == expected, 'Actual material assignment record is incomplete or changed.')
+    fitting = state.get('actual_material_fit_settings', {})
+    require(all(fitting.get(key) == 1. for key in (
+        'fit materials with multi-coefficient model', 'fit sampled materials', 'fit analytic materials',
+        'override materials frequency range')), 'Actual RCWA material fit settings are incomplete or disabled.')
+    for key, wanted in zip(('materials minimum wavelength', 'materials maximum wavelength'),
+                           spec['fit_wavelength_range_nm']):
+        require(np.isclose(fitting.get(key, 0), wanted*1e-9, rtol=1e-12, atol=1e-15),
+                'Actual RCWA material fitting range differs from the requested FDTD range.')
+    actual = state.get('actual_solver', {})
+    mesh = np.asarray(actual.get('actual mesh cells x', []), dtype=float).reshape(-1)
+    require(mesh.size == 1 and mesh[0] == settings['mesh_cells_x'], 'Actual material/depth mesh differs from requested settings.')
+    positions = np.asarray(actual.get('interface actual positions', [])).reshape(-1)
+    expected_positions = np.asarray(spec['interfaces_nm'])*1e-9
+    require(positions.shape == expected_positions.shape
+            and np.allclose(positions, expected_positions, rtol=1e-10, atol=1e-15),
+            'Actual material/depth interfaces differ from explicit layer geometry.')
 
 
 def read_acquisition(folder):
@@ -395,11 +602,18 @@ def read_acquisition(folder):
     require(state.get('status') == 'RAW_COMPLETE_PHASE_UNCALIBRATED', 'Native acquisition is incomplete or failed.')
     require(state.get('backend_fingerprint') == backend_fingerprint(), 'RCWA backend fingerprint changed; raw data must be reacquired.')
     frozen = json.loads((folder / 'input.json').read_text(encoding='utf8'))
+    verify_material_databases(frozen['case']['model'])
     require(state.get('input_sha256') == canonical_hash(frozen), 'Frozen RCWA input checksum mismatch.')
     require(frozen.get('backend_fingerprint') == backend_fingerprint(), 'Frozen RCWA backend fingerprint is stale.')
     require(frozen.get('geometry') == geometry_spec(frozen['case']['model']), 'Frozen RCWA geometry differs from the shared geometry.')
     required_files = ['rcwa_model.fsp', 'native_rcwa.mat', 'build_run_export.lsf', 'worker.log'] + [
         f'native_{name}.{suffix}' for name in DATASETS for suffix in ('npz', 'json')]
+    if has_named_materials(frozen['case']['model']):
+        required_files += ['material_resolution.json', 'resolved_geometry.json', 'executed_build.lsf']
+        if state.get('resolved_geometry', {}).get('absorbing_substrate'):
+            required_files += ['depth_check/' + name for name in (
+                ['rcwa_model.fsp', 'native_rcwa.mat', 'executed_build.lsf'] + [
+                    f'native_{name}.{suffix}' for name in DATASETS for suffix in ('npz', 'json')])]
     require(isinstance(state.get('file_sha256'), dict), 'Native artifact checksums are absent.')
     for name in required_files:
         require((folder / name).is_file() and (folder / name).stat().st_size > 0, f'Missing or empty native artifact: {name}')
@@ -409,8 +623,24 @@ def read_acquisition(folder):
     actual = state.get('actual_solver',{})
     mesh = np.asarray(actual.get('actual mesh cells x',[]),dtype=float).reshape(-1)
     require(mesh.size==1 and mesh[0]==frozen['settings']['mesh_cells_x'], 'Actual RCWA mesh differs from the calibrated requested mesh.')
+    actual_spec = frozen['geometry']
+    if has_named_materials(frozen['case']['model']):
+        resolution = json.loads((folder/'material_resolution.json').read_text(encoding='utf8'))
+        model = frozen['case']['model']
+        require(resolution.get('material_databases') == model.get('material_databases', [])
+                and resolution.get('fit_wavelength_range_nm') == list(fit_range_nm(model))
+                and resolution.get('target_wavelength_nm') == float(model['wavelength_nm']),
+                'Material resolution is not bound to frozen MDF content, wavelength and fitting range.')
+        actual_spec = resolved_geometry(frozen['geometry'], resolution, frozen['settings'])
+        require(state.get('material_resolution') == resolution, 'Material provenance differs from its archived resolution.')
+        require(state.get('resolved_geometry') == actual_spec
+                and json.loads((folder/'resolved_geometry.json').read_text(encoding='utf8')) == actual_spec,
+                'Resolved RCWA geometry differs from frozen shapes and measured material response.')
+        verify_actual_material_settings(state, actual_spec, frozen['settings'])
+        require(state.get('material_index_verification') == validate_material_index(datasets['index'], actual_spec),
+                'Actual material-index proof does not reproduce from raw index data.')
     positions = np.asarray(actual.get('interface actual positions',[]),dtype=float).reshape(-1)
-    expected = np.asarray(frozen['geometry']['interfaces_nm'])*1e-9
+    expected = np.asarray(actual_spec['interfaces_nm'])*1e-9
     require(positions.shape==expected.shape and np.allclose(positions,expected,rtol=1e-10,atol=1e-15),
             'Actual RCWA outer/internal interfaces differ from the frozen geometry.')
     axes,shape,attributes = _layout(datasets['grating_characterization'])
@@ -418,6 +648,22 @@ def read_acquisition(folder):
     actual_count = np.asarray(actual.get('num_k',[]),dtype=float).reshape(-1)
     require(actual_count.size==1 and actual_count[0]==len(axes['n'][1]), 'Recorded actual num_k disagrees with the native full-order axis.')
     validate_native_transverse_origin(datasets['index'], frozen['case']['model'], frozen['settings'])
+    if actual_spec.get('absorbing_substrate'):
+        doubled = resolved_geometry(frozen['geometry'], state['material_resolution'], frozen['settings'], 2.)
+        record = state.get('substrate_depth_check', {})
+        require(record.get('resolved_geometry') == doubled, 'Missing actual doubled-depth geometry.')
+        verify_actual_material_settings(record, doubled, frozen['settings'])
+        require(all(record.get('material_resolution', {}).get(key) == state['material_resolution'][key]
+                    for key in ('roles', 'material_databases', 'fit_wavelength_range_nm', 'target_wavelength_nm')),
+                'Doubled-depth material response differs from the primary acquisition.')
+        second = {name: load_native_dataset(folder/'depth_check', name) for name in DATASETS}
+        check = substrate_depth_convergence(
+            convert_native(datasets, frozen['case']['model'], frozen['settings'], resolved_spec=actual_spec),
+            convert_native(second, frozen['case']['model'], frozen['settings'], resolved_spec=doubled))
+        require(record.get('convergence') == check, 'Doubled-depth convergence does not reproduce from raw native files.')
+        require(record.get('material_index_verification') == validate_material_index(second['index'], doubled),
+                'Doubled-depth actual material-index proof changed.')
+        validate_native_transverse_origin(second['index'], frozen['case']['model'], frozen['settings'])
     return frozen, state, datasets
 
 
@@ -658,6 +904,8 @@ def require_phase_calibration(certificate, model, settings, version):
 def export_calibrated(folder, certificate):
     frozen, state, datasets = read_acquisition(folder)
     model, settings = frozen['case']['model'], frozen['settings']
+    if has_named_materials(model):
+        return export_material_calibrated(folder, certificate, (frozen, state, datasets))
     require_phase_calibration(certificate, model, settings, state['lumerical_version'])
     arrays, diagnostic = convert_native(datasets, model, settings, certificate['registration'])
     folder = Path(folder)
@@ -677,5 +925,199 @@ def export_calibrated(folder, certificate):
                 'phase_convention': 'exp(+ik.r-iwt); fixed physical x=0 registered only by independently validated hypothesis',
                 'certificate_sha256': canonical_hash(certificate), 'result_sha256': sha256(destination),
                 'conversion_diagnostics': diagnostic}
+    write_json(folder/'rcwa_coefficients.metadata.json', metadata)
+    return destination
+
+
+def _material_family(model):
+    family = copy.deepcopy(model)
+    family.pop('ridge_shift_nm', None)
+    return canonical_hash(family)
+
+
+def calibrate_materials(acquisition_folders, origin_folders=None):
+    """A separate evidence gate for the exact named-material acquisitions.
+
+    Every active named material needs a complex Fresnel planar control at each
+    requested mesh. Diffracting families additionally need real held-out rigid
+    translations, two-mesh convergence and the independent absolute Born proof.
+    This certificate never extends the legacy lossless n=1.5 calibration.
+    """
+    report = {'schema_version': 'materials-1.0', 'status': 'FAIL',
+              'backend_fingerprint': backend_fingerprint(), 'registration': 'cell_origin_half_cell',
+              'checks': [], 'evidence': [], 'levels': [],
+              'absolute_phase_status': 'UNVERIFIED',
+              'scope': {'mode': 'exact_acquisitions_only', 'incident_medium': 'air',
+                        'materials': 'passive isotropic named MCM fit', 'acquisition_inputs': []},
+              'tolerances': {'planar_complex_absolute': 1e-6, 'parasitic_power': 1e-10,
+                             'translation_complex_relative': .02, 'mesh_complex_l2': .03,
+                             'mesh_total_R_absolute': .01}}
+    def check(name, error, limit):
+        error = float(error)
+        report['checks'].append({'name': name, 'error': error, 'limit': limit,
+                                'status': 'PASS' if math.isfinite(error) and error <= limit else 'FAIL'})
+    records, versions, scopes = [], set(), set()
+    for folder in acquisition_folders:
+        frozen, state, datasets = read_acquisition(folder)
+        model, settings = frozen['case']['model'], frozen['settings']
+        require(has_named_materials(model), 'Material calibration only accepts named-material acquisitions.')
+        actual = state['resolved_geometry']
+        arrays, diagnostic = convert_native(datasets, model, settings, report['registration'], actual)
+        records.append((frozen, state, arrays, diagnostic))
+        report['evidence'].append(acquisition_evidence(folder, frozen, state))
+        report['scope']['acquisition_inputs'].append(state['input_sha256'])
+        versions.add(state['lumerical_version'])
+        scopes.add(canonical_hash({key: model[key] for key in ('wavelength_nm', 'period_nm')} | {
+            'fit_range': list(fit_range_nm(model)), 'material_databases': model.get('material_databases', []),
+            'reference_y_um': model['sim']['reference_y_um'],
+            'transmission_y_um': model['sim']['transmission_y_um']}))
+        if actual['absorbing_substrate']:
+            convergence = state['substrate_depth_check']['convergence']
+            check(f'{frozen["case"]["id"]}_{settings["name"]}_substrate_depth_complex',
+                  convergence['complex_relative_l2'], 1e-4)
+            check(f'{frozen["case"]["id"]}_{settings["name"]}_substrate_depth_R',
+                  convergence['total_reflected_power_absolute'], 1e-5)
+    require(records and len(versions) == len(scopes) == 1,
+            'Material controls must share one solver version, wavelength, period, fit range, MDF and reference planes.')
+    report['lumerical_version'] = next(iter(versions))
+    meshes = sorted({r[0]['settings']['mesh_cells_x'] for r in records})
+    diffracting = [r for r in records if r[0]['case']['model'].get('geometry_kind', 'ah53') != 'planar_interface']
+    if diffracting:
+        require(len(meshes) == 2, 'Diffracting named-material controls require exactly two independent meshes.')
+    planar_materials = {}
+    for mesh in meshes:
+        level = [r for r in records if r[0]['settings']['mesh_cells_x'] == mesh]
+        require(len({canonical_hash(r[0]['settings']) for r in level}) == 1,
+                'One complete settings tuple is required per material-control mesh.')
+        report['levels'].append(level[0][0]['settings'])
+        for frozen, state, arrays, diagnostic in level:
+            model = frozen['case']['model']
+            if model.get('geometry_kind') != 'planar_interface':
+                continue
+            require(not model.get('films'), 'Material planar controls must have no films.')
+            sub = state['material_resolution']['roles']['substrate']
+            n = complex(sub['n'], sub['k'])
+            expected = (1-n)/(1+n) * np.exp(4j*np.pi*1800./float(model['wavelength_nm']))
+            i = int(np.flatnonzero(arrays['r_orders'] == 0)[0])
+            label = f'{frozen["case"]["id"]}_{mesh}'
+            check(label+'_complex_Fresnel', np.max(np.abs(arrays['r_E'][i]-np.eye(2)*expected)), 1e-6)
+            check(label+'_parasitic_reflection', sum(np.sum(arrays['eta_r_'+p][arrays['r_orders'] != 0]) for p in 'sp'), 1e-10)
+            if sub.get('kind') == 'database':
+                planar_materials[(mesh, sub['name'])] = sub
+        for frozen, state, arrays, diagnostic in level:
+            for box in state['resolved_geometry']['boxes']:
+                if not box.get('material_name'):
+                    continue
+                name = box['material_name']
+                control = planar_materials.get((mesh, name))
+                require(control is not None, f'Missing independent planar material control for {name!r} at mesh {mesh}.')
+                require(abs(complex(control['n'], control['k'])-complex(box['n'], box['k'])) <= 1e-12,
+                        'Planar and structured material models differ.')
+        groups = {}
+        for record in level:
+            if record[0]['case']['model'].get('geometry_kind', 'ah53') != 'planar_interface':
+                groups.setdefault(_material_family(record[0]['case']['model']), []).append(record)
+        for family, group in groups.items():
+            zero = [r for r in group if float(r[0]['case']['model'].get('ridge_shift_nm', 0)) == 0]
+            moved = [r for r in group if float(r[0]['case']['model'].get('ridge_shift_nm', 0)) != 0]
+            require(len(zero) == 1 and bool(moved), 'Every material geometry family needs its own zero-shift and held-out translation.')
+            base = zero[0]
+            model = base[0]['case']['model']
+            for translated in moved:
+                shift = float(translated[0]['case']['model']['ridge_shift_nm'])
+                a, b = base[2]['r_E'], translated[2]['r_E']
+                orders = base[2]['r_orders']
+                require(np.array_equal(orders, translated[2]['r_orders']), 'Material translation changes air-port order coverage.')
+                expected = np.exp(-2j*np.pi*orders*shift/float(model['period_nm']))
+                for j, pol in enumerate('sp'):
+                    mask = (np.abs(orders) <= 5) & (orders != 0) & (np.abs(a[:, j, j]) >= 1e-4)
+                    require(np.count_nonzero(mask) >= 2, 'Material translation phase has fewer than two observable nonzero orders.')
+                    error = np.max(np.abs(b[mask, j, j]/a[mask, j, j]-expected[mask]))
+                    check(f'{family}_{mesh}_{shift}_translation_{pol}', error, .02)
+    if diffracting:
+        levels = report['levels']
+        require(levels[1]['max_number_k_vectors'] > levels[0]['max_number_k_vectors'],
+                'Finer material controls must independently increase Fourier truncation.')
+        baseline = records[0][0]['case']['model']
+        scope = {'wavelength_nm': baseline['wavelength_nm'], 'period_nm': baseline['period_nm'],
+                 'n_substrate': 1.5, 'n_incident': 1.,
+                 'reference_y_um': baseline['sim']['reference_y_um'],
+                 'transmission_y_um': baseline['sim']['transmission_y_um'],
+                 'coordinates': 'normal incidence; real constant isotropic media; rectangular staircase; Q=(x,z,-y)'}
+        proof = verify_absolute_origin(origin_folders, levels, scope, report['lumerical_version'])
+        report['absolute_origin'] = proof
+        check('independent_absolute_x0_origin', 0 if proof['status'] == 'PASS' else 1, 0)
+        report['absolute_phase_status'] = 'VERIFIED_ABSOLUTE_X0' if proof['status'] == 'PASS' else 'UNVERIFIED'
+        by_case = {}
+        for record in records:
+            by_case.setdefault(record[0]['case']['digest'], []).append(record)
+        for digest, group in by_case.items():
+            require(len(group) == 2, 'Each material control must exist at both mesh levels.')
+            coarse, fine = sorted(group, key=lambda r: r[0]['settings']['mesh_cells_x'])
+            require(np.array_equal(coarse[2]['r_orders'], fine[2]['r_orders']), 'Material mesh order sets differ.')
+            mask = np.abs(fine[2]['r_orders']) <= 5
+            norm = max(float(np.linalg.norm(fine[2]['r_E'][mask])), 1e-8)
+            check(digest+'_mesh_reflection_complex_l2',
+                  np.linalg.norm(coarse[2]['r_E'][mask]-fine[2]['r_E'][mask])/norm, .03)
+            check(digest+'_mesh_reflection_total_power',
+                  max(abs(coarse[3]['total_power']['R'+p]-fine[3]['total_power']['R'+p]) for p in 'sp'), .01)
+        for frozen, state, arrays, diagnostic in records:
+            dx = frozen['case']['model']['period_nm']/frozen['settings']['mesh_cells_x']
+            require(all(abs(box[edge]/dx-round(box[edge]/dx)) < 1e-8
+                        for box in frozen['geometry']['boxes'] if box['material'] != 'substrate'
+                        for edge in ('x_min_nm', 'x_max_nm')),
+                    'Material absolute-origin scope requires aligned rectangular x boundaries.')
+    else:
+        report['absolute_phase_status'] = 'VERIFIED_PLANAR_SPECULAR_ONLY'
+        report['absolute_origin'] = None
+    report['status'] = 'PASS' if report['checks'] and all(c['status'] == 'PASS' for c in report['checks']) else 'FAIL'
+    return report
+
+
+def require_material_calibration(certificate, folder):
+    require(isinstance(certificate, dict) and certificate.get('schema_version') == 'materials-1.0'
+            and certificate.get('status') == 'PASS', 'Named materials require their separate material-control certificate.')
+    require(certificate.get('backend_fingerprint') == backend_fingerprint(), 'Material certificate fingerprint is stale.')
+    evidence = certificate.get('evidence', [])
+    require(evidence and str(Path(folder).resolve()) in {e['folder'] for e in evidence},
+            'Material certificate covers only its exact real acquisitions, not arbitrary models.')
+    for item in evidence + (certificate.get('absolute_origin') or {}).get('evidence', []):
+        require(sha256(Path(item['folder'])/'native_status.json') == item['native_status_sha256'],
+                'Material calibration evidence status checksum changed.')
+    refreshed = calibrate_materials([e['folder'] for e in evidence],
+        [e['folder'] for e in (certificate.get('absolute_origin') or {}).get('evidence', [])])
+    require(refreshed['status'] == 'PASS' and canonical_hash(refreshed) == canonical_hash(certificate),
+            'Material certificate does not reproduce from actual native evidence.')
+
+
+def export_material_calibrated(folder, certificate, acquisition=None):
+    frozen, state, datasets = acquisition or read_acquisition(folder)
+    require_material_calibration(certificate, folder)
+    actual = state['resolved_geometry']
+    arrays, diagnostic = convert_native(datasets, frozen['case']['model'], frozen['settings'],
+                                         certificate['registration'], actual)
+    folder = Path(folder)
+    destination = folder/'rcwa_coefficients.npz'
+    np.savez_compressed(destination, **arrays)
+    metadata = {'backend': 'RCWA', 'backend_fingerprint': backend_fingerprint(),
+        'input_sha256': state['input_sha256'], 'lumerical_version': state['lumerical_version'],
+        'phase_status': 'CALIBRATED_ON_EXACT_MATERIAL_CONTROL_ACQUISITIONS',
+        'absolute_phase_status': certificate['absolute_phase_status'],
+        'scope': certificate['scope'], 'registration': certificate['registration'],
+        's_matrix_scope': diagnostic['s_matrix_scope'],
+        'materials': frozen['geometry']['source_shapes_xy_nm'],
+        'material_resolution': state['material_resolution'],
+        'material_index_verification': state['material_index_verification'],
+        'substrate_depth_check': state.get('substrate_depth_check'),
+        'terminal_negligible_fit_loss_approximation': actual['terminal_negligible_fit_loss_approximation'],
+        'transmission_scope': actual['transmission_scope'],
+        'transmission_validation': 'Terminal-port conversion independently matches native fields/powers; no claim of internal FDTD T equality.',
+        'reference_planes': {key: actual[key] for key in ('source_reference_z_nm',
+            'reflection_reference_z_nm', 'transmission_reference_z_nm')},
+        'basis': 'AH53 s=+Z, input p=+X; outgoing p has positive X component for both sides',
+        'power': 'S11=r_power=sqrt(q_air_out)*r_E; S21=t_power=sqrt(q_terminal_out)*t_E',
+        'phase_convention': 'exp(+ik.r-iwt); fixed physical x=0',
+        'certificate_sha256': canonical_hash(certificate), 'result_sha256': sha256(destination),
+        'conversion_diagnostics': diagnostic}
     write_json(folder/'rcwa_coefficients.metadata.json', metadata)
     return destination

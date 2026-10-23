@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 from .geometry import build_geometry
+from .materials import freeze_material_databases, validate_material_config
 
 def canonical_hash(obj):
     return hashlib.sha256(json.dumps(obj,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode('utf8')).hexdigest()[:12]
@@ -32,6 +33,7 @@ def deepmerge(base, changes):
 
 
 def check_model(model):
+    validate_material_config(model)
     if model['wavelength_nm']<=0:
         raise ValueError('Wavelength must be >0.')
     mesh=model['mesh']
@@ -119,4 +121,10 @@ def load_config(path):
     data=json.loads(p.read_text(encoding='utf8'))
     if data.get('schema_version')!='2.0':
         raise ValueError('Expected schema_version 2.0')
+    if 'material_databases' in data.get('base_model', {}):
+        raise ValueError('Put material_databases at the top level, next to base_model; model records are reserved for frozen inputs.')
+    if 'material_databases' in data:
+        records=freeze_material_databases(data['material_databases'],p.parent)
+        if records:
+            data['base_model']['material_databases']=records
     return data,p

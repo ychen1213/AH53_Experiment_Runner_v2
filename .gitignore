@@ -6,6 +6,11 @@
 /.playwright-cli/
 /configs/local_runtime.json
 
+# Local optical material databases may contain unpublished measured data.
+*.[mM][dD][fF]
+/materials/*
+!/materials/README.md
+
 __pycache__/
 *.py[cod]
 .pytest_cache/

@@ -8,18 +8,26 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, asdict
 from typing import List, Optional
+from .materials import material_spec
 
 @dataclass
 class Shape:
     name: str
     material: str
-    index_n: float
+    index_n: Optional[float]
     x1_nm: float
     x2_nm: float
     y1_nm: float
     y2_nm: float
     # Vertices for a nonvertical ridge; leave empty for rectangles.
     vertices_nm: Optional[list] = None
+    # Preserve the material role above; database selectors are separate.
+    material_name: Optional[str] = None
+
+
+def _shape_material(model, role):
+    spec = material_spec(model, role)
+    return (spec.get('n'), spec.get('name'))
 
 
 def _unique_sorted(vs, tol=1e-6):
@@ -42,13 +50,14 @@ def build_geometry(cfg: dict) -> tuple[list[Shape], float, dict]:
     L = float(c['period_nm'])
     kind = c.get('geometry_kind', 'ah53')
     if kind == 'planar_interface':
-        n_sub = float(c['n_substrate'])
-        if not (L > 0 and n_sub > 0):
+        n_sub, substrate_name = _shape_material(c, 'substrate')
+        if not L > 0:
             raise ValueError('Planar interface requires positive period and substrate index.')
         if c.get('films'):
             raise ValueError('Planar-interface benchmark must not contain films.')
         shapes = [Shape('substrate', 'substrate', n_sub,
-                        -L/2-500, L/2+500, -1600, 0)]
+                        -L/2-500, L/2+500, -1600, 0,
+                        material_name=substrate_name)]
         return shapes, 0.0, {'geometry_kind': kind, 'period_nm': L,
                             'interface_y_nm': 0.0, 'shape_count': 1,
                             'top_nm': 0.0, 'film_history': [],
@@ -58,8 +67,8 @@ def build_geometry(cfg: dict) -> tuple[list[Shape], float, dict]:
     p = float(c['child_pitch_nm'])
     cd = float(c['ridge_cd_nm'])
     h = float(c['ridge_height_nm'])
-    n_sub = float(c['n_substrate'])
-    n_ridge = float(c['n_ridge'])
+    n_sub, substrate_name = _shape_material(c, 'substrate')
+    n_ridge, ridge_name = _shape_material(c, 'ridge')
     offsets = c.get('ridge_center_offsets_nm', [0.0,0.0,0.0])
     shift = float(c.get('ridge_shift_nm',0.0))
     left_inset = float(c.get('ridge_top_left_inset_nm',0.0))
@@ -69,8 +78,6 @@ def build_geometry(cfg: dict) -> tuple[list[Shape], float, dict]:
         raise ValueError('Require period,pitch,CD,height positive and CD < child pitch.')
     if len(offsets) != 3:
         raise ValueError('ridge_center_offsets_nm must contain three values.')
-    if min(n_sub,n_ridge) <= 0:
-        raise ValueError('Material indices must be > 0 for this lossless demonstration.')
     if left_inset < 0 or right_inset < 0 or left_inset+right_inset >= cd:
         raise ValueError('Top insets must be non-negative and sum to less than CD.')
     if (left_inset > 0 or right_inset > 0) and films:
@@ -82,12 +89,13 @@ def build_geometry(cfg: dict) -> tuple[list[Shape], float, dict]:
         raise ValueError('Ridges cross mother-period boundary; wrap support is not implemented.')
     if not (highs[0] < lows[1] and highs[1] < lows[2]):
         raise ValueError('Overlapping or out-of-order ridges.')
-    out = [Shape('substrate','substrate',n_sub, -L/2-500, L/2+500, -1600,0)]
+    out = [Shape('substrate','substrate',n_sub, -L/2-500, L/2+500, -1600,0,
+                 material_name=substrate_name)]
     for i,(lo,hi) in enumerate(zip(lows,highs),start=1):
         vertices = None
         if left_inset or right_inset:
             vertices = [[lo,0],[hi,0],[hi-right_inset,h],[lo+left_inset,h]]
-        out.append(Shape(f'ridge_{i}','ridge',n_ridge,lo,hi,0,h,vertices))
+        out.append(Shape(f'ridge_{i}','ridge',n_ridge,lo,hi,0,h,vertices,ridge_name))
     edges = [-L/2]
     tops = []
     for lo,hi in zip(lows,highs):
@@ -101,12 +109,9 @@ def build_geometry(cfg: dict) -> tuple[list[Shape], float, dict]:
     for fid,film in enumerate(films,1):
         mode = str(film.get('mode','none')).lower()
         t = float(film.get('thickness_nm',0))
-        n = float(film.get('n',1))
-        k = float(film.get('k',0))
-        if mode not in ('none','conformal','planarized') or t<0 or n<=0:
+        n, film_name = _shape_material(c, f'film_{fid}')
+        if mode not in ('none','conformal','planarized') or t<0:
             raise ValueError(f'Invalid film configuration #{fid}: {film}')
-        if abs(k) > 1e-15:
-            raise ValueError('Current physical solver uses real n only; k != 0 would silently be wrong.')
         if mode == 'none':
             continue
         material = f'film_{fid}'
@@ -118,7 +123,7 @@ def build_geometry(cfg: dict) -> tuple[list[Shape], float, dict]:
                 if new_y > old_y + 1e-9:
                     original_film_objects+=1
                     out.append(Shape(f'film_{fid}_seg_{original_film_objects}',material,n,
-                                     edges[j],edges[j+1],old_y,new_y))
+                                     edges[j],edges[j+1],old_y,new_y,material_name=film_name))
             tops=[new_y]*len(tops)
         else:
             if t == 0:
@@ -148,10 +153,11 @@ def build_geometry(cfg: dict) -> tuple[list[Shape], float, dict]:
                 new_tops.append(new_y)
                 if new_y>old_y+1e-9:
                     original_film_objects+=1
-                    out.append(Shape(f'film_{fid}_seg_{original_film_objects}',material,n,xl,xr,old_y,new_y))
+                    out.append(Shape(f'film_{fid}_seg_{original_film_objects}',material,n,xl,xr,old_y,new_y,
+                                     material_name=film_name))
             tops=new_tops
         history.append({'film_index':fid,'mode':mode,'thickness_nm':t,'n':n,
-                        'resulting_top_nm':max(tops)})
+                        'material_name':film_name,'resulting_top_nm':max(tops)})
     final_top = max(tops)
     return out,final_top,{'period_nm':L,'ridge_centers_nm':centers,'film_history':history,
                           'shape_count':len(out),'top_nm':final_top,

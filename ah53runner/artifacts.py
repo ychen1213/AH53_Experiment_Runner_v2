@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 
 import numpy as np
+from .materials import (EFFECTIVE_ABSORPTION_K_THRESHOLD, is_effectively_absorbing,
+                        material_spec, fit_range_nm, verify_material_databases)
 
 
 class ArtifactError(ValueError):
@@ -20,7 +22,7 @@ def strict_json_loads(value):
 
 def solver_fingerprint():
     digest = hashlib.sha256()
-    for name in ('solver.py', 'geometry.py'):
+    for name in ('solver.py', 'geometry.py', 'materials.py'):
         digest.update(name.encode('utf8'))
         digest.update((Path(__file__).parent / name).read_bytes())
     return digest.hexdigest()[:16]
@@ -62,6 +64,53 @@ def _close(actual, expected, name):
              f'{name}: inconsistent derived values')
 
 
+def _material_evidence(folder, case, metadata):
+    model = case['model']
+    verify_material_databases(model)
+    materials = metadata.get('materials')
+    required = (bool(model.get('material_databases'))
+                or 'substrate_material' in model or 'ridge_material' in model
+                or any('material' in film for film in model.get('films', [])))
+    if materials is None and not required:
+        return
+    _require(isinstance(materials, dict), 'missing material resolution provenance')
+    material_file = folder/'material_resolution.json'
+    _require(metadata.get('material_resolution_sha256') == file_sha256(material_file),
+             'material resolution checksum mismatch or missing')
+    _require(_json(material_file) == materials, 'material resolution metadata mismatch')
+    _require(materials.get('material_databases') == model.get('material_databases', []),
+             'material database provenance differs from frozen inputs')
+    _require(materials.get('schema_version') == '1.0', 'unsupported material evidence schema')
+    _require(materials.get('material_checks', {}).get('status') == 'PASS',
+             'material preflight checks did not pass')
+    _close(materials.get('fit_wavelength_range_nm'), fit_range_nm(model), 'material fit range')
+    _close(materials.get('target_wavelength_nm'), model['wavelength_nm'], 'material target wavelength')
+    # Geometry determines the actually used roles, including planarized t=0 fill.
+    from .geometry import build_geometry
+    shapes, _, _ = build_geometry(model)
+    expected_roles = {shape.material for shape in shapes}
+    roles = materials.get('roles', {})
+    _require(set(roles) == expected_roles, 'resolved material roles differ from geometry')
+    for role in expected_roles:
+        spec = material_spec(model, role)
+        actual = roles[role]
+        _require(actual.get('kind') == spec['kind'], f'{role}: material kind mismatch')
+        if spec['kind'] == 'database':
+            _require(actual.get('name') == spec['name'], f'{role}: material name mismatch')
+            _require(actual.get('validation', {}).get('status') == 'PASS',
+                     f'{role}: named material checks did not pass')
+        for key in ('n', 'k', 'raw_n', 'raw_k'):
+            value = actual.get(key)
+            _require(isinstance(value, (int, float)) and np.isfinite(value),
+                     f'{role}: missing/nonfinite actual material {key}')
+        _require(actual['n'] >= -1e-12 and actual['k'] >= -1e-12
+                 and actual['raw_n'] >= -1e-12 and actual['raw_k'] >= -1e-12,
+                 f'{role}: invalid/nonpassive actual material index')
+        if spec['kind'] == 'constant':
+            _close(actual['n'], spec['n'], f'{role} constant n')
+            _close(actual['k'], 0, f'{role} constant k')
+
+
 def load_artifacts(folder, case, require_done=True):
     """Read and validate everything, returning data only after all checks pass.
 
@@ -86,6 +135,7 @@ def load_artifacts(folder, case, require_done=True):
         for key in ('case_id', 'digest', 'solver_fingerprint'):
             expected = case['id'] if key == 'case_id' else case.get(key)
             _require(metadata.get(key) == expected, f'metadata {key} mismatch')
+        _material_evidence(folder, case, metadata)
         result_path = folder / 'result.npz'
         _require(metadata.get('result_sha256') == file_sha256(result_path),
                  'result.npz checksum mismatch or missing')
@@ -141,6 +191,30 @@ def load_artifacts(folder, case, require_done=True):
             _close(quality['power_closure_' + pol], reflected + transmitted, f'closure_{pol}')
             _close(quality['flux_decomposition_error_' + pol], abs(reflected - np.sum(eta)),
                    f'flux discrepancy_{pol}')
+            if 'materials' in metadata:
+                _close(quality.get('energy_residual_' + pol), 1-reflected-transmitted,
+                       f'energy residual_{pol}')
+                for flux_name in ('reflection', 'transmission'):
+                    flux = quality.get(f'signed_{flux_name}_flux_{pol}')
+                    _require(isinstance(flux, (int, float)) and np.isfinite(flux),
+                             f'missing/nonfinite signed {flux_name} flux_{pol}')
+                    expected_flux = reflected if flux_name == 'reflection' else transmitted
+                    _close(abs(flux), expected_flux, f'signed {flux_name} magnitude_{pol}')
+        if 'materials' in metadata:
+            absorbing = any(is_effectively_absorbing(role) for role in metadata['materials']['roles'].values())
+            _require(quality.get('absorption_present') is absorbing, 'material absorption flag mismatch')
+            _require(quality.get('absorption_k_threshold') == EFFECTIVE_ABSORPTION_K_THRESHOLD,
+                     'absorption classification threshold mismatch')
+            _close(quality.get('maximum_fitted_k'),
+                   max(role['k'] for role in metadata['materials']['roles'].values()),
+                   'maximum actual fitted k')
+            _require(quality.get('energy_check_kind') == (
+                'passive_flux_bound' if absorbing else 'lossless_flux_closure'),
+                'energy check semantics mismatch')
+            planes = metadata.get('power_monitor_planes', {})
+            for kind in ('reflection', 'transmission'):
+                _close(planes.get(kind+'_y_um'), case['model']['sim'][kind+'_y_um'],
+                       kind+' flux plane')
         _require(metadata.get('quality') == quality, 'metadata quality mismatch')
         _require(isinstance(metadata.get('jones_phase_status'), str), 'missing phase calibration status')
         nearfields = {}
@@ -157,6 +231,7 @@ def load_artifacts(folder, case, require_done=True):
                 _require(e2.shape == (len(x), len(y)) and np.isfinite(e2).all() and np.all(e2 >= 0),
                          f'{pol} nearfield E2 invalid')
                 nearfields[pol] = {'x_um': x, 'y_um': y, 'E2': e2}
+        verify_material_databases(case['model'])
         return {'result': result, 'quality': quality, 'metadata': metadata, 'nearfields': nearfields}
     except ArtifactError:
         raise

@@ -48,8 +48,10 @@ def fresnel_at_reference(n_substrate, wavelength_nm, reference_y_um,
     """
     if incident_spatial_phase_sign not in (-1, 1):
         raise ValueError('Incident spatial phase sign must be -1 or +1.')
-    if n_substrate <= 0 or wavelength_nm <= 0:
-        raise ValueError('Index and wavelength must be positive.')
+    n_substrate = complex(n_substrate)
+    if (not np.isfinite(n_substrate) or n_substrate.real < -1e-12
+            or n_substrate.imag < -1e-12 or abs(n_substrate) == 0 or wavelength_nm <= 0):
+        raise ValueError('Require a finite passive index and positive wavelength.')
     phase = (-2j * incident_spatial_phase_sign * 2 * math.pi
              * (reference_y_um * 1000 - interface_y_nm) / wavelength_nm)
     return (1 - n_substrate) / (1 + n_substrate) * np.exp(phase)
@@ -87,9 +89,21 @@ def check_common(result, tolerances):
         checks.append(_check(f'air_reference_leakage_{pol}', reference_power,
                              tolerances['reference_leakage_power_max'],
                              detail='Required independently measured null reflection; no inferred or filled value.'))
-        checks.append(_check(f'energy_closure_{pol}',
-                             abs(q[f'power_closure_{pol}'] - 1),
-                             tolerances['power_closure_absolute']))
+        if q.get('absorption_present', False):
+            checks.append(_check(f'passive_flux_bound_{pol}',
+                                 max(0., q[f'power_closure_{pol}'] - 1),
+                                 tolerances['power_closure_absolute'],
+                                 detail='R+T_plane may be below 1 due to absorption. This bound does not independently validate absorption or numerical convergence.'))
+        else:
+            checks.append(_check(f'energy_closure_{pol}',
+                                 abs(q[f'power_closure_{pol}'] - 1),
+                                 tolerances['power_closure_absolute']))
+        if f'signed_reflection_flux_{pol}' in q:
+            checks.append(_check(f'outgoing_flux_direction_{pol}',
+                                 max(0., -q[f'signed_reflection_flux_{pol}'],
+                                     q[f'signed_transmission_flux_{pol}']),
+                                 tolerances['power_closure_absolute'],
+                                 detail='Reflection is +Y and transmission is -Y; signed native flux retained.'))
         checks.append(_check(f'fourier_flux_agreement_{pol}',
                              q[f'flux_decomposition_error_{pol}'],
                              tolerances['flux_decomposition_absolute']))
@@ -113,7 +127,11 @@ def check_common(result, tolerances):
 def check_planar(case, result, tolerances):
     cfg = case['model']
     q = result['quality']
-    n = float(cfg['n_substrate'])
+    if cfg.get('substrate_material'):
+        substrate = result['materials']['roles']['substrate']
+        n = complex(substrate['n'], substrate['k'])
+    else:
+        n = complex(cfg['n_substrate'])
     expected = fresnel_at_reference(n, float(result['lambda_nm'][0]),
                                     cfg['sim']['reference_y_um'],
                                     q['incident_spatial_phase_sign'])
@@ -141,6 +159,18 @@ def check_planar(case, result, tolerances):
                  else tolerances['fresnel_power_absolute'])
         checks.append(_check(f'fresnel_total_power_{pol}',
                              abs(q[f'total_reflected_{pol}'] - expected_R), limit))
+        # The original constant-n benchmark retains its established checks.
+        # Named substrates additionally validate material-dependent attenuation.
+        if cfg.get('substrate_material') and 'materials' in result and f'total_transmitted_{pol}' in q:
+            depth_nm = -1000*float(cfg['sim']['transmission_y_um'])
+            if depth_nm <= 0:
+                raise ValueError('Planar transmission validation requires a plane inside the substrate.')
+            expected_T = (n.real * abs(2/(1+n))**2
+                          * np.exp(-4*np.pi*n.imag*depth_nm/float(result['lambda_nm'][0])))
+            checks.append(_check(f'fresnel_internal_plane_transmission_{pol}',
+                                 abs(q[f'total_transmitted_{pol}']-expected_T),
+                                 tolerances['fresnel_power_absolute'],
+                                 detail=f'Independent half-space Fresnel flux with exp(-4*pi*k*depth/lambda); depth={depth_nm:g} nm, expected T={expected_T:.12g}.'))
         nonzero = result['orders'] != 0
         checks.append(_check(f'planar_parasitic_orders_{pol}',
                              np.sum(result[f'eta_{pol}'][nonzero]),
@@ -225,10 +255,14 @@ def load_completed_case(folder, case):
         raise ValueError('Frozen case differs from the current benchmark configuration.')
     artifacts = load_artifacts(folder, case)
     metadata = artifacts['metadata']
-    if '2D lossless dielectric XY' != metadata.get('physical_model'):
-        raise ValueError('Physical model is not the supported 2D lossless dielectric FDTD model.')
+    if metadata.get('physical_model') not in (
+            '2D lossless dielectric XY', '2D passive isotropic dispersive XY',
+            '2D passive isotropic dispersive absorbing XY'):
+        raise ValueError('Physical model is not the supported 2D passive isotropic FDTD model.')
     result = artifacts['result']
     result['quality'] = artifacts['quality']
+    if 'materials' in metadata:
+        result['materials'] = metadata['materials']
     return result, metadata
 
 
@@ -302,9 +336,9 @@ def validate_results(config, config_path):
             translation_checked = True
     coverage = {
         'air_interface': any(c['model'].get('geometry_kind') == 'planar_interface'
-                             and c['model']['n_substrate'] == 1 for c in cases),
+                             and c['model'].get('n_substrate') == 1 for c in cases),
         'n15_interface': any(c['model'].get('geometry_kind') == 'planar_interface'
-                             and c['model']['n_substrate'] == 1.5 for c in cases),
+                             and c['model'].get('n_substrate') == 1.5 for c in cases),
         'symmetric_ah53': any(c['model'].get('geometry_kind', 'ah53') == 'ah53'
                               and c['model'].get('ridge_shift_nm', 0) == 0
                               and c['model'].get('ridge_center_offsets_nm', [0, 0, 0]) == [0, 0, 0]

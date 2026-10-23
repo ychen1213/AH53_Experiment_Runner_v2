@@ -1,0 +1,71 @@
+{
+  "schema_version": "2.0",
+  "output_dir": "../output_ah53_materials_rcwa_planar_780",
+  "lumerical_api_python": "D:/Ansys Inc/v252/Lumerical/api/python",
+  "max_case_minutes": 15,
+  "capture_field_count_per_group": 0,
+  "rcwa_levels": [
+    {
+      "name": "planar",
+      "mesh_cells_x": 256,
+      "max_number_k_vectors": 32,
+      "conversion_absolute": 1e-08
+    }
+  ],
+  "base_model": {
+    "geometry_kind": "planar_interface",
+    "period_nm": 1600,
+    "child_pitch_nm": 320,
+    "ridge_cd_nm": 160,
+    "ridge_height_nm": 100,
+    "ridge_shift_nm": 0,
+    "ridge_center_offsets_nm": [
+      0,
+      0,
+      0
+    ],
+    "ridge_top_left_inset_nm": 0,
+    "ridge_top_right_inset_nm": 0,
+    "wavelength_nm": 780,
+    "films": [],
+    "mesh": {
+      "mode": "override",
+      "mesh_accuracy": 2,
+      "dx_nm": 25,
+      "dy_nm": 5
+    },
+    "sim": {
+      "simulation_time_fs": 900,
+      "y_min_um": -1.3,
+      "y_max_um": 2.3,
+      "mesh_y_min_um": -1.3,
+      "mesh_y_max_um": 2.3,
+      "pml_layers": 16,
+      "pml_profile": 1,
+      "source_y_um": 1.35,
+      "incident1_y_um": 1.0,
+      "incident2_y_um": 1.1,
+      "reflection_y_um": 1.63,
+      "transmission_y_um": -1.05,
+      "reference_y_um": 1.8,
+      "field_y_min_um": -0.8,
+      "field_y_max_um": 1.2,
+      "stripe_z_span_um": 1.0
+    },
+    "substrate_material": "AH53_TEST_Silicon",
+    "ridge_material": "AH53_TEST_Silicon"
+  },
+  "experiments": [
+    {
+      "name": "material_planar_silicon",
+      "parameter": "wavelength_nm",
+      "values": [
+        780
+      ],
+      "note": "Separate single-wavelength control suite at780 nm; material fit uses680-880nm rather than the643nm band."
+    }
+  ],
+  "material_databases": [
+    "../materials/ah53_demo.mdf"
+  ]
+}

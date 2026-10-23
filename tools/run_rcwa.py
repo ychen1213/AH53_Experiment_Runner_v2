@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from ah53runner.planning import load_config, plan
 from ah53runner import rcwa
+from ah53runner.materials import has_named_materials, resolve_materials, verify_material_databases
 
 
 def stamp():
@@ -305,6 +306,7 @@ def worker(folder):
     rcwa.write_json(folder/'native_status.json', state)
     try:
         rcwa.require(frozen['backend_fingerprint'] == rcwa.backend_fingerprint(), 'Backend changed after planning.')
+        verify_material_databases(frozen['case']['model'])
         refuse_running_fdtd()
         rcwa.validate_settings(frozen['settings'], frozen['case']['model'])
         rcwa.require(frozen['geometry'] == rcwa.geometry_spec(frozen['case']['model']), 'Frozen geometry is not the shared geometry.')
@@ -323,20 +325,36 @@ def worker(folder):
             session.cd(str(folder))
             script = (folder/'build_run_export.lsf').read_text(encoding='utf8')
             rcwa.require(script == rcwa.build_lsf(frozen['geometry'], frozen['settings']), 'Execution script differs from the frozen generated script.')
-            session.eval(script)
-            for name in rcwa.DATASETS:
-                print('TRANSFER_NATIVE_DATASET:',name,flush=True)
-                if name=='index':
-                    dataset,state['native_index_transfer']=read_packed_native_index(session,lumapi)
-                else:
-                    dataset=session.getresult('RCWA',name)
-                rcwa.save_native_dataset(dataset, folder, name)
-                print('SAVED_NATIVE_DATASET:',name,flush=True)
-            state['actual_solver'] = {}
-            for name in ('num_k','simulation_run_time','total_threads','peak_memory'):
-                state['actual_solver'][name] = np_value(session.getresult('RCWA',name))
-            for prop in ('interface actual positions','actual mesh cells x'):
-                state['actual_solver'][prop] = np_value(session.getnamed('RCWA',prop))
+            model, settings = frozen['case']['model'], frozen['settings']
+            if has_named_materials(model):
+                session.newproject()
+                resolution = resolve_materials(session, model)
+                actual_spec = rcwa.resolved_geometry(frozen['geometry'], resolution, settings)
+                state['material_resolution'] = resolution
+                state['resolved_geometry'] = actual_spec
+                rcwa.write_json(folder/'material_resolution.json', resolution)
+                rcwa.write_json(folder/'resolved_geometry.json', actual_spec)
+                datasets, details = run_material_variant(session, lumapi, folder, actual_spec, settings)
+                state.update(details)
+                if actual_spec['absorbing_substrate']:
+                    session.newproject()
+                    repeated = resolve_materials(session, model)
+                    rcwa.require(all(repeated[key] == resolution[key] for key in (
+                        'roles', 'material_databases', 'fit_wavelength_range_nm', 'target_wavelength_nm')),
+                        'Material response changed between substrate depth acquisitions.')
+                    doubled = rcwa.resolved_geometry(frozen['geometry'], resolution, settings, 2.)
+                    other, detail = run_material_variant(session, lumapi, folder/'depth_check', doubled, settings)
+                    convergence = rcwa.substrate_depth_convergence(
+                        rcwa.convert_native(datasets, model, settings, resolved_spec=actual_spec),
+                        rcwa.convert_native(other, model, settings, resolved_spec=doubled))
+                    state['substrate_depth_check'] = dict(detail, resolved_geometry=doubled,
+                        convergence=convergence, material_resolution=repeated)
+                    print('ABSORBING SUBSTRATE DEPTH CHECK:', convergence['status'], flush=True)
+            else:
+                session.eval(script)
+                datasets, details = collect_native(session, lumapi, folder)
+                state.update(details)
+            verify_material_databases(model)
             state['resource_policy'] = 'Independent hidden session; existing RCWA resource settings unchanged.'
         deadline=time.monotonic()+15
         while active_owned_cads(state['owned_cad_processes']) and time.monotonic()<deadline:
@@ -352,6 +370,56 @@ def worker(folder):
         state.update(status='FAILED', finished_at=stamp(), error=repr(error))
         rcwa.write_json(folder/'native_status.json',state)
         return 1
+
+
+def collect_native(session, lumapi, folder):
+    datasets, details = {}, {}
+    for name in rcwa.DATASETS:
+        print('TRANSFER_NATIVE_DATASET:', name, flush=True)
+        if name == 'index':
+            dataset, details['native_index_transfer'] = read_packed_native_index(session, lumapi)
+        else:
+            dataset = session.getresult('RCWA', name)
+        rcwa.save_native_dataset(dataset, folder, name)
+        datasets[name] = dataset
+    details['actual_solver'] = {}
+    for name in ('num_k', 'simulation_run_time', 'total_threads', 'peak_memory'):
+        details['actual_solver'][name] = np_value(session.getresult('RCWA', name))
+    for prop in ('interface actual positions', 'actual mesh cells x'):
+        details['actual_solver'][prop] = np_value(session.getnamed('RCWA', prop))
+    return datasets, details
+
+
+def run_material_variant(session, lumapi, folder, spec, settings):
+    """Session already holds verified MDF imports; no reset may occur here."""
+    folder.mkdir(parents=True, exist_ok=True)
+    session.cd(str(folder))
+    script = rcwa.build_lsf(spec, settings, new_project=False, run=False)
+    (folder/'executed_build.lsf').write_text(script + rcwa.run_lsf(), encoding='utf8')
+    session.eval(script)
+    assignments = {}
+    for box in spec['boxes']:
+        actual = str(session.getnamed(box['name'], 'material'))
+        expected = box.get('material_name', '<Object defined dielectric>')
+        rcwa.require(actual == expected, 'Actual object material differs: ' + box['name'])
+        assignments[box['name']] = actual
+    fitting = {}
+    for name in ('fit materials with multi-coefficient model', 'fit sampled materials',
+                 'fit analytic materials', 'override materials frequency range'):
+        value = float(np.asarray(session.getnamed('RCWA', name)).reshape(-1)[0])
+        rcwa.require(value == 1., 'Required RCWA material-fit option was not applied: ' + name)
+        fitting[name] = value
+    for name, expected in zip(('materials minimum wavelength', 'materials maximum wavelength'),
+                              spec['fit_wavelength_range_nm']):
+        value = float(np.asarray(session.getnamed('RCWA', name)).reshape(-1)[0])
+        rcwa.require(np.isclose(value, expected*1e-9, rtol=1e-12, atol=1e-15),
+                     'RCWA/FDTD material fitting range mismatch.')
+        fitting[name] = value
+    session.eval(rcwa.run_lsf())
+    datasets, details = collect_native(session, lumapi, folder)
+    details.update(actual_material_assignments=assignments, actual_material_fit_settings=fitting,
+                   material_index_verification=rcwa.validate_material_index(datasets['index'], spec))
+    return datasets, details
 
 
 def np_value(value):
@@ -412,8 +480,10 @@ def acquire(folder, timeout_seconds):
     status_path = folder/'native_status.json'
     state = json.loads(status_path.read_text(encoding='utf8')) if status_path.exists() else {}
     if code == 0 and state.get('status') == 'RAW_COLLECTED':
-        state['file_sha256'] = {entry.name:rcwa.sha256(entry) for entry in folder.iterdir()
-                                if entry.is_file() and entry.name!='native_status.json'}
+        state['file_sha256'] = {entry.relative_to(folder).as_posix():rcwa.sha256(entry)
+                               for entry in folder.rglob('*') if entry.is_file()
+                               and 'attempts' not in entry.relative_to(folder).parts
+                               and entry.name!='native_status.json'}
         state['status'] = 'RAW_COMPLETE_PHASE_UNCALIBRATED'
         state['returncode'] = code
         rcwa.write_json(status_path,state)
@@ -431,7 +501,8 @@ def acquire(folder, timeout_seconds):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', nargs='?', default='plan', choices=('plan','run','calibrate','export','_worker'))
+    parser.add_argument('command', nargs='?', default='plan', choices=(
+        'plan','run','calibrate','export','calibrate-materials','export-materials','_worker'))
     parser.add_argument('--config', default=str(ROOT/'configs'/'rcwa_validation.json'))
     parser.add_argument('--origin-config', default=str(ROOT/'configs'/'rcwa_origin_validation.json'),
                         help='Independent four-control Born input plan, required for calibration/export; never starts it automatically.')
@@ -465,11 +536,16 @@ def main():
                     print('PLANNED:',folder,flush=True)
                 print('NO SOLVER RUNS WERE PERFORMED.',flush=True)
                 return 0
-            # RCWA acquisition remains downstream of the same real FDTD physics and quick gates.
-            sys.path.insert(0,str(ROOT/'tools'))
-            from run_validated_overnight import evaluate_gate
-            gate,unused = evaluate_gate(ROOT/'configs'/'physics_validation.json',ROOT/'configs'/'quick_check.json')
-            rcwa.require(gate['status']=='PASS','FDTD physics/quick gate must PASS before RCWA acquisition: '+'; '.join(gate['errors']))
+            # The old constant-index path retains its original FDTD gate. Named
+            # material raw acquisitions instead undergo actual material checks;
+            # their separately gated exports cannot inherit the n=1.5 proof.
+            if any(not has_named_materials(item['case']['model']) for item in selected):
+                sys.path.insert(0,str(ROOT/'tools'))
+                from run_validated_overnight import evaluate_gate
+                gate,unused = evaluate_gate(ROOT/'configs'/'physics_validation.json',ROOT/'configs'/'quick_check.json')
+                rcwa.require(gate['status']=='PASS','FDTD physics/quick gate must PASS before RCWA acquisition: '+'; '.join(gate['errors']))
+            else:
+                print('NAMED MATERIAL RAW ACQUISITION: material preflight required; certified export requires separate real controls.', flush=True)
             refuse_running_fdtd()
             count = 0
             failed = False
@@ -499,13 +575,19 @@ def main():
                 if code==130:
                     return code
             return 1 if failed else 0
-        certificate_path=output/'rcwa_phase_calibration.json'
-        if args.command=='calibrate':
+        material_mode = args.command in ('calibrate-materials', 'export-materials')
+        certificate_path=output/('rcwa_material_calibration.json' if material_mode else 'rcwa_phase_calibration.json')
+        if args.command in ('calibrate', 'calibrate-materials'):
             try:
-                origin_folders=origin_plan_folders(args.origin_config)
-                certificate=rcwa.calibrate(folders,args.registration,origin_folders)
+                if material_mode:
+                    needs_origin = any(item['case']['model'].get('geometry_kind', 'ah53') != 'planar_interface' for item in selected)
+                    origin_folders = origin_plan_folders(args.origin_config) if needs_origin else []
+                    certificate = rcwa.calibrate_materials(folders, origin_folders)
+                else:
+                    origin_folders=origin_plan_folders(args.origin_config)
+                    certificate=rcwa.calibrate(folders,args.registration,origin_folders)
             except (OSError,ValueError,KeyError,TypeError) as error:
-                certificate={'schema_version':'2.0','status':'FAIL','backend_fingerprint':rcwa.backend_fingerprint(),
+                certificate={'schema_version':'materials-1.0' if material_mode else '2.0','status':'FAIL','backend_fingerprint':rcwa.backend_fingerprint(),
                              'registration':args.registration,'error':str(error),'evaluated_at':stamp()}
             attempt_path=output/'calibration_attempts'/(datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'_'+args.registration+'.json')
             rcwa.write_json(attempt_path,certificate)
@@ -516,7 +598,8 @@ def main():
                 print(certificate['error'],flush=True)
             return 0 if certificate['status']=='PASS' else 2
         certificate=json.loads(certificate_path.read_text(encoding='utf8'))
-        origin_plan_folders(args.origin_config,certificate)
+        if not material_mode or certificate.get('absolute_origin'):
+            origin_plan_folders(args.origin_config,certificate)
         for folder in folders:
             print('EXPORTED:',rcwa.export_calibrated(folder,certificate),flush=True)
         return 0

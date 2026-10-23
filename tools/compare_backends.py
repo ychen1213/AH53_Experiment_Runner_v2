@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 from ah53runner import rcwa
 from ah53runner.artifacts import load_artifacts, solver_fingerprint, strict_json_loads
 from ah53runner.geometry import build_geometry, shapes_to_json
+from ah53runner.materials import has_named_materials, fit_range_nm
 
 # Fixed before acquiring cross-backend comparison data. Do not relax these
 # thresholds to fit a computed result; refine numerical settings instead.
@@ -42,6 +43,9 @@ def require(condition, message):
 def matching_geometry(fdtd_model, rcwa_model):
     for key in ('period_nm', 'wavelength_nm'):
         require(fdtd_model[key] == rcwa_model[key], f'Physical {key} differs between backends.')
+    require(fdtd_model.get('material_databases', []) == rcwa_model.get('material_databases', []),
+            'MDF content identities differ between backends.')
+    require(fit_range_nm(fdtd_model) == fit_range_nm(rcwa_model), 'Material fitting wavelength ranges differ.')
     fdtd_shapes, fdtd_top, _ = build_geometry(fdtd_model)
     rcwa_shapes, rcwa_top, _ = build_geometry(rcwa_model)
     require(shapes_to_json(fdtd_shapes) == shapes_to_json(rcwa_shapes) and fdtd_top == rcwa_top,
@@ -57,15 +61,32 @@ def load_inputs(fdtd_folder, rcwa_folder, certificate_path):
     fdtd_case = strict_json_loads((fdtd_folder / 'case.json').read_text(encoding='utf8'))
     fdtd_case['solver_fingerprint'] = solver_fingerprint()
     fdtd = load_artifacts(fdtd_folder, fdtd_case)
-    require(fdtd['metadata'].get('physical_model') == '2D lossless dielectric XY', 'Unsupported FDTD physical model.')
+    require(fdtd['metadata'].get('physical_model') in ('2D lossless dielectric XY',
+            '2D passive isotropic dispersive XY', '2D passive isotropic dispersive absorbing XY'),
+            'Unsupported FDTD physical model.')
     require(fdtd['quality']['incident_spatial_phase_sign'] == -1, 'Unsupported FDTD time/spatial phase convention.')
     require(fdtd['metadata'].get('basis') == {'input_s': 'Ez', 'input_p': '+Ex',
             'output_s': 'Ez', 'output_p': '(cos(theta),-sin(theta),0)'}, 'FDTD polarization basis is not the shared basis.')
     frozen, state, native = rcwa.read_acquisition(rcwa_folder)
     certificate = strict_json_loads(certificate_path.read_text(encoding='utf8'))
-    rcwa.require_phase_calibration(certificate, frozen['case']['model'], frozen['settings'], state['lumerical_version'])
+    named = has_named_materials(frozen['case']['model'])
+    if named:
+        rcwa.require_material_calibration(certificate, rcwa_folder)
+        fm = fdtd['metadata'].get('materials', {})
+        rm = state['material_resolution']
+        require(fm.get('fit_wavelength_range_nm') == rm.get('fit_wavelength_range_nm'),
+                'Actual material-fit bandwidths differ between backends.')
+        require(set(fm.get('roles', {})) == set(rm['roles']), 'Actual material roles differ.')
+        for role, record in rm['roles'].items():
+            other = fm['roles'][role]
+            require(record.get('name') == other.get('name') and record['kind'] == other['kind']
+                    and abs(complex(record['n'], record['k'])-complex(other['n'], other['k'])) <= 1e-6,
+                    'Actual fitted n/k differ between backends: ' + role)
+    else:
+        rcwa.require_phase_calibration(certificate, frozen['case']['model'], frozen['settings'], state['lumerical_version'])
     metadata = strict_json_loads((rcwa_folder / 'rcwa_coefficients.metadata.json').read_text(encoding='utf8'))
-    require(metadata.get('phase_status') == 'CALIBRATED_ON_CURRENT_RCWA_CONTROL_FAMILY',
+    require(metadata.get('phase_status') == ('CALIBRATED_ON_EXACT_MATERIAL_CONTROL_ACQUISITIONS'
+                                            if named else 'CALIBRATED_ON_CURRENT_RCWA_CONTROL_FAMILY'),
             'Native or uncalibrated RCWA data cannot be evaluated as a calibrated comparison.')
     require(metadata.get('backend_fingerprint') == rcwa.backend_fingerprint(), 'RCWA coefficient backend fingerprint is stale.')
     require(metadata.get('input_sha256') == state['input_sha256'], 'RCWA export input hash differs from the actual native acquisition.')
@@ -77,7 +98,8 @@ def load_inputs(fdtd_folder, rcwa_folder, certificate_path):
     require(metadata.get('result_sha256') == rcwa.sha256(coefficients), 'RCWA coefficient checksum mismatch.')
     with np.load(coefficients, allow_pickle=False) as archive:
         converted = {key: archive[key].copy() for key in archive.files}
-    recomputed, diagnostics = rcwa.convert_native(native, frozen['case']['model'], frozen['settings'], certificate['registration'])
+    recomputed, diagnostics = rcwa.convert_native(native, frozen['case']['model'], frozen['settings'],
+        certificate['registration'], state.get('resolved_geometry') if named else None)
     for key in ('r_orders', 'r_theta_deg', 'r_E', 'r_power', 'S11', 'eta_r_s', 'eta_r_p', 'lambda_nm'):
         require(key in converted and converted[key].shape == recomputed[key].shape
                 and np.isfinite(converted[key]).all()
