@@ -3,6 +3,10 @@
 /output_*/
 /logs/
 /local_validation/
+/lsf_exports/
+# User-provided source scripts and exported personal task bundles stay local.
+/02_AH53_XY_FDTD_2023R2_1.lsf
+/lsf+json_test/
 /.playwright-cli/
 /configs/local_runtime.json
 

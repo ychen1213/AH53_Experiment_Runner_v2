@@ -286,12 +286,14 @@ class TestRunnerIntegrity(unittest.TestCase):
     def test_cli_locks_before_prepare_and_keeps_full_manifest_for_only(self):
         second=copy.deepcopy(self.case);second['id']='other_000';second['group']='other'
         cfg={'output_dir':str(self.root)}
+        config_path=self.root/'config.json'
+        dump_json(config_path,cfg)
         def preparing(path,config,cases,preview=True):
             self.assertEqual(len(cases),2)
             with self.assertRaises(RuntimeError):
                 with QueueLock(self.root):pass
             return self.root
-        with patch('sys.argv',['run_experiments.py','plan','--only','fixture']), \
+        with patch('sys.argv',['run_experiments.py','plan','--config',str(config_path),'--only','fixture']), \
              patch('run_experiments.load_config',return_value=(cfg,self.root/'config.json')), \
              patch('run_experiments.plan',return_value=[self.case,second]), \
              patch('run_experiments.prepare',side_effect=preparing), \

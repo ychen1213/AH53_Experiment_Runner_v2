@@ -36,10 +36,28 @@ def status_of(path):
 
 def result_valid(folder,case):
     try:
-        load_artifacts(folder,case)
+        load_case_artifacts(folder,case)
         return True
-    except ArtifactError:
+    except (ArtifactError, ValueError, OSError):
         return False
+
+
+def load_case_artifacts(folder,case,require_done=True):
+    if case.get('execution_kind') == 'lsf_preflight':
+        from ah53runner.lsf_preflight import load_preflight_artifacts
+        return load_preflight_artifacts(folder,case,require_done=require_done)
+    if case.get('execution_kind') == 'lsf':
+        from ah53runner.lsf_runtime import load_lsf_artifacts
+        return load_lsf_artifacts(folder,case,require_done=require_done)
+    return load_artifacts(folder,case,require_done=require_done)
+
+
+def report_cases(output,cases,cfg):
+    if cfg.get('schema_version') == 'lsf-sweep-1.0':
+        from ah53runner.lsf_report import make_lsf_report
+        return make_lsf_report(output,cases,cfg)
+    from ah53runner.report import make_report
+    return make_report(output,cases,cfg)
 
 
 def process_alive(pid):
@@ -191,7 +209,7 @@ class QueueLock:
 def archive_previous_attempt(folder):
     """Retain previous logs, model, partial arrays, and frozen input together."""
     folder=Path(folder)
-    inputs={'case.json','geometry.json','geometry_preview.png'}
+    inputs={'case.json','geometry.json','geometry_preview.png','script.lsf','parameters.json'}
     generated=[p for p in folder.iterdir() if p.name not in inputs|{'attempts'}]
     if not generated:return None
     prior=status_of(folder/'status.json') or {}
@@ -457,7 +475,7 @@ def observed_descendants_exited(state):
     return True
 
 
-def launch_case(output,case,api_dir,timeout_s,visible):
+def launch_case(output,case,api_dir,timeout_s,visible,stop_file=None):
     folder=output/case['id']
     archive_previous_attempt(folder)
     log_path=folder/'worker.log'
@@ -467,7 +485,8 @@ def launch_case(output,case,api_dir,timeout_s,visible):
            'solver_fingerprint':case['solver_fingerprint'],'attempt_id':uuid.uuid4().hex,
            'worker_pid':None,'parent_pid':os.getpid(),'worker_log':'worker.log'}
     dump_json(status,state)
-    cmd=[sys.executable,str(ROOT/'run_case_worker.py'),'--case',str(folder/'case.json'),
+    worker = {'lsf':'run_lsf_worker.py','lsf_preflight':'run_lsf_preflight_worker.py'}.get(case.get('execution_kind'),'run_case_worker.py')
+    cmd=[sys.executable,str(ROOT/worker),'--case',str(folder/'case.json'),
          '--api-dir',str(api_dir or '')]
     if visible: cmd.append('--visible')
     begin=time.monotonic()
@@ -491,7 +510,11 @@ def launch_case(output,case,api_dir,timeout_s,visible):
             identity=process_identity(proc.pid)
             state['worker_creation_time_100ns']=identity.get('creation_time_100ns') if identity else None
             dump_json(status,state)
-            rc=wait_with_memory_samples(proc,timeout_s,state,on_sample=lambda:dump_json(status,state))
+            def update_running():
+                dump_json(status,state)
+                if stop_file is not None and Path(stop_file).exists():
+                    raise KeyboardInterrupt
+            rc=wait_with_memory_samples(proc,timeout_s,state,on_sample=update_running)
         except subprocess.TimeoutExpired:
             timedout=True
             rc=124
@@ -517,8 +540,8 @@ def launch_case(output,case,api_dir,timeout_s,visible):
         log.write(f'===== END rc={rc} elapsed_s={elapsed:.1f} timeout={timedout} =====\n')
         success=rc==0 and not interrupted and not cleanup_failed and error is None
         if success:
-            try:load_artifacts(folder,case,require_done=False)
-            except ArtifactError as exc:
+            try:load_case_artifacts(folder,case,require_done=False)
+            except (ArtifactError, ValueError, OSError) as exc:
                 success=False
                 error='artifact validation: '+str(exc)
         if error:log.write('ERROR: '+error+'\n')
@@ -533,16 +556,30 @@ def launch_case(output,case,api_dir,timeout_s,visible):
 
 
 def main():
-    p=argparse.ArgumentParser(description='Lumerical 2023 R2.1 AH53 batch experiment runner')
-    p.add_argument('command',choices=['check','plan','run','report'])
-    p.add_argument('--config',default=str(ROOT/'configs'/'quick_check.json'))
+    p=argparse.ArgumentParser(description='Full LSF batch runner; legacy AH53 geometry templates are also supported')
+    p.add_argument('command',choices=['check','plan','run','report','preflight'])
+    p.add_argument('--config',required=True,help='LSF task JSON saved by the GUI, or an explicit legacy AH53 template')
     p.add_argument('--only',default='',help='Run/plan/report only one experiment group')
     p.add_argument('--limit',type=int,default=0,help='Max number of cases to execute this time')
     p.add_argument('--retry-failed',action='store_true',help='Only retry failed, interrupted, or incomplete previous cases')
     p.add_argument('--visible',action='store_true',help='Show Lumerical GUI (diagnostic use)')
+    p.add_argument('--stop-file',help='Stop this queue when this request file appears; used by the local GUI')
     args=p.parse_args()
-    cfg,path=load_config(args.config)
-    all_cases=plan(cfg)
+    raw=strict_json_loads(Path(args.config).expanduser().read_text(encoding='utf-8-sig'))
+    lsf_mode=isinstance(raw,dict) and raw.get('schema_version')=='lsf-sweep-1.0'
+    if lsf_mode:
+        from ah53runner.lsf_runtime import load_lsf_config,plan_lsf,prepare_lsf
+        cfg,path=load_lsf_config(args.config)
+        if args.command=='preflight':
+            if args.limit<0:raise ValueError('--limit must be >=0')
+            from ah53runner.lsf_preflight import run_preflight
+            return run_preflight(cfg,path,args,sys.modules[__name__])
+        all_cases=plan_lsf(cfg,path)
+    else:
+        if args.command=='preflight':
+            raise ValueError('preflight requires a complete LSF task saved by the LSF GUI.')
+        cfg,path=load_config(args.config)
+        all_cases=plan(cfg)
     cases=all_cases
     if args.only:
         cases=[c for c in cases if c['group']==args.only]
@@ -552,7 +589,10 @@ def main():
     if not output.is_absolute():output=path.parent/output
     output=output.resolve()
     with QueueLock(output):
-        prepare(path,cfg,all_cases,preview=(args.command in ('check','plan','run')))
+        if lsf_mode:
+            prepare_lsf(path,cfg,all_cases,archive_previous_attempt)
+        else:
+            prepare(path,cfg,all_cases,preview=(args.command in ('check','plan','run')))
         return execute_command(args,cfg,path,output,cases,all_cases)
 
 
@@ -560,13 +600,13 @@ def execute_command(args,cfg,path,output,cases,all_cases):
     if args.command in ('check','plan'):
         print(f'CONFIG: {path}\nOUT: {output}\nCASES: {len(cases)}')
         for c in cases:
-            print(' ',c['id'],'=>',c['parameter'],'=',c['value'], 'nearfield=',bool(c.get('capture_field')))
+            detail='full LSF script' if c.get('execution_kind')=='lsf' else f"nearfield={bool(c.get('capture_field'))}"
+            print(' ',c['id'],'=>',c['parameter'],'=',c['value'],detail)
         print('STATE:',task_summary(output,cases))
         print('NO SOLVER RUNS WERE PERFORMED.')
         return
     if args.command=='report':
-        from ah53runner.report import make_report
-        make_report(output,cases,cfg)
+        report_cases(output,cases,cfg)
         print('Report:',output/'report.html')
         return
     # run: all cases sequentially, each in a separate process and Lumerical session.
@@ -576,6 +616,8 @@ def execute_command(args,cfg,path,output,cases,all_cases):
     interrupted=False
     try:
         for c in cases:
+            if getattr(args,'stop_file',None) and Path(args.stop_file).exists():
+                raise KeyboardInterrupt
             folder=output/c['id']
             if not should_run_case(folder,c,args.retry_failed):
                 print('SKIP',c['id'],(status_of(folder/'status.json') or {}).get('status','PENDING'),flush=True)
@@ -583,15 +625,18 @@ def execute_command(args,cfg,path,output,cases,all_cases):
             if args.limit and count>=args.limit: break
             count+=1
             print('START',c['id'],flush=True)
-            success,elapsed=launch_case(output,c,cfg.get('lumerical_api_python',''),timeout_s,args.visible)
+            launch_args=(output,c,cfg.get('lumerical_api_python',''),timeout_s,args.visible)
+            if getattr(args,'stop_file',None):
+                success,elapsed=launch_case(*launch_args,stop_file=args.stop_file)
+            else:
+                success,elapsed=launch_case(*launch_args)
             print('OK' if success else 'FAILED',c['id'],f'{elapsed:.1f}s',flush=True)
     except KeyboardInterrupt:
         interrupted=True
         print('INTERRUPTED: worker stopped and failure recorded.',flush=True)
     summary=task_summary(output,all_cases)
     print('FINISHED:',summary)
-    from ah53runner.report import make_report
-    make_report(output,all_cases,cfg)
+    report_cases(output,all_cases,cfg)
     print('Report:',output/'report.html')
     return 130 if interrupted else (1 if summary['FAILED'] else 0)
 if __name__=='__main__':
